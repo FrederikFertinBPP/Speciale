@@ -15,7 +15,7 @@ from tqdm import tqdm
 import shutil
 from gymnasium import Env
 from dataclasses import dataclass
-from utils import cache_write, Trajectory, fields
+from Speciale.utils import cache_write, Trajectory, fields
 
 
 class Agent: 

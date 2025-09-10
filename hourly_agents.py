@@ -6,9 +6,9 @@ import random
 import pandas as pd
 
 import torch
-from agent import Agent, train
-from HPP_environment import make_hpp_env
-from torch_networks import TorchActorNetwork, TorchCriticNetwork
+from Speciale.agent import Agent, train
+from Speciale.RFP_environment import make_hpp_env
+from Speciale.torch_networks import TorchActorNetwork, TorchCriticNetwork
 
 class Scaler:
     """ Scales given data to either a normal distribution with mean 0 and sd 1,
@@ -226,38 +226,14 @@ class DDPGAgent(Agent):
 
 
 if __name__ == "__main__":
-    env = make_hpp_env()
-    epsilon = lambda steps, episodes: max(0.1, 1 - steps / 10000)  # Example epsilon decay function
+    env = make_hpp_env(normalize=False)
     agent = RandomAgent(env)
-    agent_ddpg = DDPGAgent(env, alpha=0.001, epsilon=epsilon, batch_size=16, replay_buffer_size=30000, hidden=10)
-    num_episodes = 1
+    epsilon = lambda steps, episodes: max(0.1, 0.5 - steps / 10000)  # Epsilon decay function
+    env_normed = make_hpp_env(normalize=True)
+    agent_ddpg = DDPGAgent(env_normed, alpha=0.001, epsilon=epsilon, batch_size=16, replay_buffer_size=30000, hidden=10, depth=1)
+    num_episodes = 8
 
-    stats, trajectories = train(env, agent, num_episodes=num_episodes)
-    stats_dqn, trajectories_dqn = train(env, agent_ddpg, num_episodes=num_episodes, experiment_name="test") # 90 seconds/episode for now (also 37?)
+    stats, trajectories = train(env, agent, num_episodes=num_episodes, experiment_name="random_test") # Quick
+    stats_dqn, trajectories_dqn = train(env_normed, agent_ddpg, num_episodes=num_episodes, experiment_name="normalized_test") # 90 seconds/episode for now (also 37?)
     print("Training completed.")
-
-    df_ddpg_trajectories = pd.DataFrame(trajectories_dqn)
-
-    
-    state_trajectories = [np.transpose(np.asarray(trajectories[i].state)) for i in range(len(trajectories))]
-    action_trajectories = [np.transpose(np.asarray(trajectories[i].action)) for i in range(len(trajectories))]
-    reward_trajectories = [np.asarray(trajectories[i].reward) for i in range(len(trajectories))]
-    reward_trajectories_dqn = [np.asarray(trajectories_dqn[i].reward) for i in range(len(trajectories))]
-    time_trajectories = [np.asarray(trajectories[i].time) for i in range(len(trajectories))]
-    time_trajectories_dqn = [np.asarray(trajectories_dqn[i].time) for i in range(len(trajectories))]
-    plt.figure(figsize=(12, 6))
-    # for i, state in enumerate(state_trajectories):
-    #     plt.plot(state[0], label=f'SOC H2 {i+1}')
-    for i, state in enumerate(reward_trajectories):
-        plt.plot(state[0], label=f'Random reward {i+1}')
-    for i, state in enumerate(reward_trajectories_dqn):
-        plt.plot(state[0], label=f'DDPG reward {i+1}')
-    
-    plt.legend()
-    plt.xlabel('Time Steps')
-    plt.ylabel('SOC')
-    plt.title('State of Charge Over Time')
-    plt.grid()
-    plt.show()
-    plt.close()
 
