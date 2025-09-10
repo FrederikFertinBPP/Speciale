@@ -45,9 +45,9 @@ class Contract(Component):
             parameters (dict, optional): Parameters for the contract.
         """
         super().__init__(name, parameters, notes)
-        if "frequency" in parameters and parameters["frequency"] not in self.frequency_options:
-            raise ValueError(f"Invalid frequency '{parameters['frequency']}' for contract '{name}'. Valid options are: {self.frequency_options}")
-        self.frequency = parameters.get("frequency")
+        if "target_frequency" in parameters and parameters["target_frequency"] not in self.frequency_options:
+            raise ValueError(f"Invalid frequency '{parameters['target_frequency']}' for contract '{name}'. Valid options are: {self.frequency_options}")
+        self.frequency = parameters.get("target_frequency")
 
 class Carrier():
     def __init__(self, name:str) -> None:
