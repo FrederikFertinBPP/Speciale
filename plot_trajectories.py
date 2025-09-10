@@ -1,11 +1,11 @@
 """ Script to plot trajectories from a saved file. """
-from Speciale.utils import cache_exists, cache_read
+from utils import cache_exists, cache_read
 import os
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
-from Speciale.RFP_environment import make_hpp_env
+from RFP_environment import make_hpp_env
 
 def load_trajectories(experiment_name, ):
     # Get latest of the experiments if there are multiple of the same name:

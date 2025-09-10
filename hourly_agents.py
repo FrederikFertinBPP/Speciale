@@ -6,9 +6,9 @@ import random
 import pandas as pd
 
 import torch
-from Speciale.agent import Agent, train
-from Speciale.RFP_environment import make_hpp_env
-from Speciale.torch_networks import TorchActorNetwork, TorchCriticNetwork
+from agent import Agent, train
+from RFP_environment import make_hpp_env
+from torch_networks import TorchActorNetwork, TorchCriticNetwork
 
 class Scaler:
     """ Scales given data to either a normal distribution with mean 0 and sd 1,

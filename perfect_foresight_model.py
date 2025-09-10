@@ -1,4 +1,4 @@
-from Speciale.RFP_initialization import RenewableFuelPlant, make_rfp
+from RFP_initialization import RenewableFuelPlant, make_rfp
 import pyomo.environ as pyo
 from pyomo.network import Port, Arc
 import numpy as np

@@ -2,7 +2,7 @@ import gymnasium as gym
 import numpy as np
 import pandas as pd
 import os
-from Speciale.RFP_initialization import RenewableFuelPlant, make_rfp
+from RFP_initialization import RenewableFuelPlant, make_rfp
 
 class RFPEnv(gym.Env):
 
