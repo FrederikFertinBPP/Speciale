@@ -12,9 +12,9 @@ class PerfectForesightModel:
         self.objective      = None
         self.model          = None
         # Initialize the optimization model
-        self.build_model()
+        self._build_abstract_model()
 
-    def build_model(self):
+    def _build_abstract_model(self):
         # 1. Initialize the model
         self.model = pyo.AbstractModel()
         self.model.T = pyo.RangeSet(0, self.horizon - 1)  # Time steps
@@ -28,7 +28,7 @@ class PerfectForesightModel:
         self.model.contracts    = pyo.Set(initialize=[name for name, cont in self.rfp.get_contracts()])
 
         # self.model.store_cap    = pyo.Param(self.model.storages,  initialize={name: comp.parameters["capacity"] for name, comp in self.rfp.get_components() if comp.is_storage})
-        self.model.supplier_cf  = pyo.Param(self.model.suppliers, self.model.T)
+        self.model.supplier_cf  = pyo.Param(self.model.suppliers, self.model.T, within=pyo.NonNegativeReals)
 
         def storageBlock_rule(b, stor):
             storage = self.rfp.get_component(stor)
@@ -50,17 +50,17 @@ class PerfectForesightModel:
             b.out_port.add(b.discharge, "out_flow")
         self.model.storageBlocks = pyo.Block(self.model.storages, rule=storageBlock_rule)
 
-        def supplierBlock_rule(b, supp):
+        def supplierBlock_rule(b, supp, t):
             supplier = self.rfp.get_component(supp)
             b.out_port = Port()
-            b.production = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, supplier.parameters.get('capacity', np.inf)))
+            b.production = pyo.Var(domain=pyo.NonNegativeReals, bounds=(0, supplier.parameters.get('capacity', np.inf)))
             b.carrier_in = str(supplier.parameters["consumes"])
             b.carrier_out = str(supplier.parameters["produces"])
-            def max_production_rule(m, t):
-                return b.production[t] <= self.model.supplier_cf[supp, t] * supplier.parameters.get('capacity', np.inf)
-            b.CapConstraint = pyo.Constraint(self.model.T, rule=max_production_rule)
+            # def max_production_rule(m):
+                # return b.production <= self.model.supplier_cf[supp, t] * supplier.parameters.get('capacity', np.inf)
+            # b.CapConstraint = pyo.Constraint(rule=max_production_rule)
             b.out_port.add(b.production, "out_flow")
-        self.model.supplierBlocks = pyo.Block(self.model.suppliers, rule=supplierBlock_rule)
+        self.model.supplierBlocks = pyo.Block(self.model.suppliers, self.model.T, rule=supplierBlock_rule)
         
         def offtakerBlock_rule(b, offt):
             offtaker = self.rfp.get_component(offt)
@@ -89,63 +89,39 @@ class PerfectForesightModel:
 
         def carrierBlock_rule(b, carr):
             carrier = self.rfp.get_carrier(carr)
-            b.inflow = pyo.Var(self.model.T, domain=pyo.NonNegativeReals)
-            b.outflow = pyo.Var(self.model.T, domain=pyo.NonNegativeReals)
             b.type = carrier.name
             ports_in = [] ### From here we need to work ###
             ports_out = []
             for stor in self.model.storages:
                 if self.model.storageBlocks[stor].carrier_in == carr:
-                    ports_in.append(self.model.storageBlocks[stor].in_port)
+                    ports_out.append(self.model.storageBlocks[stor].in_port)
                 if self.model.storageBlocks[stor].carrier_out == carr:
-                    ports_out.append(self.model.storageBlocks[stor].out_port)
+                    ports_in.append(self.model.storageBlocks[stor].out_port)
             for supp in self.model.suppliers:
                 if self.model.supplierBlocks[supp].carrier_out == carr:
-                    ports_out.append(self.model.supplierBlocks[supp].out_port)
+                    ports_in.append(self.model.supplierBlocks[supp].out_port)
             for offt in self.model.offtakers:
                 if self.model.offtakerBlocks[offt].carrier_in == carr:
-                    ports_in.append(self.model.offtakerBlocks[offt].in_port)
+                    ports_out.append(self.model.offtakerBlocks[offt].in_port)
             for lin in self.model.links:
                 if self.model.linkBlocks[lin].carrier_in == carr:
-                    ports_in.append(self.model.linkBlocks[lin].in_port)
+                    ports_out.append(self.model.linkBlocks[lin].in_port)
                 if self.model.linkBlocks[lin].carrier_out == carr:
-                    ports_out.append(self.model.linkBlocks[lin].out_port)
+                    ports_in.append(self.model.linkBlocks[lin].out_port)
+            b.in_flow = Port(ports=ports_in)
+            b.out_flow = Port(ports=ports_out)
+            b.carrier_balances = Arc(b.in_port, b.out_port, self.model.T)
         self.model.carrierBlocks = pyo.Block(self.model.carriers, rule=carrierBlock_rule)
 
+        def contractOfftake_rule(b, cont):
+            contract = self.rfp.get_contract(cont)
+            b.in_port = Port()
+            b.volume = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, contract.parameters.get('volume', np.inf)))
+            b.penalty = contract.parameters.get('penalty', 0)
+            b.carrier_in = str(contract.parameters["consumes"])
+            b.carrier_out = str(contract.parameters["produces"])
+            b.in_port.add(b.volume, "in_flow")
         cm = self.model.create_instance()
-
-        # Create Arcs to connect the ports through their respective carriers
-        for carr in self.model.carriers:
-            ports_in = []
-            ports_out = []
-            for stor in self.model.storages:
-                if self.model.storageBlocks[stor].carrier_in == carr:
-                    ports_in.append(self.model.storageBlocks[stor].in_port)
-                if self.model.storageBlocks[stor].carrier_out == carr:
-                    ports_out.append(self.model.storageBlocks[stor].out_port)
-            for supp in self.model.suppliers:
-                if self.model.supplierBlocks[supp].carrier_out == carr:
-                    ports_out.append(self.model.supplierBlocks[supp].out_port)
-            for offt in self.model.offtakers:
-                if self.model.offtakerBlocks[offt].carrier_in == carr:
-                    ports_in.append(self.model.offtakerBlocks[offt].in_port)
-            for lin in self.model.links:
-                if self.model.linkBlocks[lin].carrier_in == carr:
-                    ports_in.append(self.model.linkBlocks[lin].in_port)
-                if self.model.linkBlocks[lin].carrier_out == carr:
-                    ports_out.append(self.model.linkBlocks[lin].out_port)
-            for p_in in ports_in:
-                for p_out in ports_out:
-                    arc = Arc(source=p_out, destination=p_in)
-                    setattr(self.model, f"arc_{carr}_{len(self.model.component_objects(Arc))}", arc)
-
-
-
-        # 2. Define variables
-        self.add_variables()
-
-        # 3. Define constraints
-        self.add_constraints()
 
         # 4. Define objective
         self.set_objective()
