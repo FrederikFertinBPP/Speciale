@@ -13,11 +13,12 @@ class Component():
         self.name = name
         self.parameters = parameters
         self.notes = notes
+        self.type = parameters.get("type")
 
 class PhysicalUnit(Component):
-    type_options = ("link", "storage", "supplier", "offtaker")
+    type_options = ("grid", "link", "storage", "supplier", "offtaker")
 
-    def __init__(self, name:str, parameters:dict = {}, notes:str = "") -> None:
+    def __init__(self, name:str, parameters:dict = {}, ppa = None, offtake_contracts = None, notes:str = "") -> None:
         """
         Initialize a unit of the hybrid power plant.
         Args:
@@ -27,27 +28,43 @@ class PhysicalUnit(Component):
         super().__init__(name, parameters, notes)
         if "type" in parameters and parameters["type"] not in self.type_options:
             raise ValueError(f"Invalid type '{parameters['type']}' for unit '{name}'. Valid options are: {self.type_options}")
-        self.type = parameters.get("type")
+        self.is_grid     = self.type == "grid"
         self.is_link     = self.type == "link"
         self.is_storage  = self.type == "storage"
-        self.is_producer = self.type == "producer"
         self.is_supplier = self.type == "supplier"
         self.is_offtaker = self.type == "offtaker"
+        if ppa is not None:
+            self.ppa = ppa
+        if offtake_contracts is not None:
+            self.contracts = offtake_contracts
 
 class Contract(Component):
     frequency_options = ("hourly", "daily", "monthly", "yearly")
+    frequency_period_map = {"hourly" : 1, "daily" : 24, "monthly" : 30*24, "yearly" : 8760}
 
     def __init__(self, name:str, parameters:dict = {}, notes:str = "") -> None:
         """
-        Initialize a contract for the hybrid power plant.
+        Initialize a contract for the renewable fuel plant.
         Args:
             name (str): The name of the contract.
             parameters (dict, optional): Parameters for the contract.
         """
         super().__init__(name, parameters, notes)
-        if "target_frequency" in parameters and parameters["target_frequency"] not in self.frequency_options:
-            raise ValueError(f"Invalid frequency '{parameters['target_frequency']}' for contract '{name}'. Valid options are: {self.frequency_options}")
-        self.frequency = parameters.get("target_frequency")
+        _tf = parameters.get("target_frequency")
+        self.target_frequency = _tf if _tf in self.frequency_options else None
+
+class PPA(Component):
+    types = ["wind", "solar", "nuclear"]
+
+    def __init__(self, name:str, parameters:dict = {}, notes:str = "") -> None:
+        """
+        Initialize a PPA for the renewable fuel plant.
+        Args:
+            name (str): The name of the PPA.
+            parameters (dict, optional): Parameters for the PPA.
+        """
+        super().__init__(name, parameters, notes)
+        self.simulate_profile = bool(parameters.get("simulated"))
 
 class Carrier():
     def __init__(self, name:str) -> None:
@@ -58,6 +75,33 @@ class RenewableFuelPlant():
         self.components = {}
         self.contracts = {}
         self.carriers = {}
+        self.ppas = {}
+
+    def add_ppa(self, ppa):
+        """
+        Add a ppa to the hybrid power plant system.
+        Args:
+            ppa (object): The ppa to add to the system.
+        """
+        self.ppas[ppa.name] = ppa
+    
+    def get_ppa(self, name):
+        """
+        Get a ppa by its name.
+        Args:
+            name (str): The name of the ppa to retrieve.
+        Returns:
+            object: The contract with the specified name, or None if not found.
+        """
+        return self.ppas.get(name, None)
+
+    def get_ppas(self):
+        """
+        Get the dict of ppas in the hybrid power plant system.
+        Returns:
+            dict: A dict of ppas in the system.
+        """
+        return self.ppas.items()
 
     def add_contract(self, contract):
         """
@@ -143,23 +187,35 @@ def load_input_data():
     df_components = pd.read_excel(xls_path, sheet_name="Components")
     df_contracts = pd.read_excel(xls_path, sheet_name="Contracts")
     df_carriers = pd.read_excel(xls_path, sheet_name="Carriers")
-    return df_components, df_contracts, df_carriers
+    df_ppas = pd.read_excel(xls_path, sheet_name="PPAs")
+    return df_components, df_contracts, df_carriers, df_ppas
 
 def make_rfp():
     """
     Create a renewable fuel plant with defined components (i.e. fixed capacities and such) and contracts.
     """
     rfp = RenewableFuelPlant()
-    df_components, df_contracts, df_carriers = load_input_data()
+    df_components, df_contracts, df_carriers, df_ppas = load_input_data()
     
-    for _, row in df_components.iterrows():
-        parameters = {k: v for k, v in row.items() if pd.notna(v) and k not in ["name", "notes"]}
-        rfp.add_component(PhysicalUnit(name=row["name"], parameters=parameters, notes=row.get("notes", "")))
+    for _, row in df_carriers.iterrows():
+        rfp.add_carrier(Carrier(name=row["name"]))
     for _, row in df_contracts.iterrows():
         parameters = {k: v for k, v in row.items() if pd.notna(v) and k not in ["name", "notes"]}
         rfp.add_contract(Contract(name=row["name"], parameters=parameters, notes=row.get("notes", "")))
-    for _, row in df_carriers.iterrows():
-        rfp.add_carrier(Carrier(name=row["name"]))
+    for _, row in df_ppas.iterrows():
+        parameters = {k: v for k, v in row.items() if pd.notna(v) and k not in ["name", "notes"]}
+        rfp.add_ppa(PPA(name=row["name"], parameters=parameters, notes=row.get("notes", "")))
+    for _, row in df_components.iterrows():
+        parameters = {k: v for k, v in row.items() if pd.notna(v) and k not in ["name", "notes"]}
+        ppa = None
+        offtake_contracts = None
+        if parameters["type"] == "supplier":
+            ppa = rfp.get_ppa(row["name"])
+        elif parameters["type"] == "offtaker":
+            offtake_contracts = [cont for name, cont in rfp.get_contracts() if cont.type == parameters["produces"]]
+            for cont in offtake_contracts:
+                cont.offtaker = row['name']
+        rfp.add_component(PhysicalUnit(name=row["name"], parameters=parameters, ppa=ppa, offtake_contracts=offtake_contracts, notes=row.get("notes", "")))
     
     return rfp
 

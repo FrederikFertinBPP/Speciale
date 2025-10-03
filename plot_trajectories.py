@@ -1,5 +1,5 @@
 """ Script to plot trajectories from a saved file. """
-from utils import cache_exists, cache_read
+from utils import cache_read
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -89,8 +89,6 @@ def plot_env_info(trajectories, **kwargs):
         start_row = last_row
     sns.lineplot(df)
     plt.show()
-
-
 
 if __name__ == "__main__":
     env = make_hpp_env()

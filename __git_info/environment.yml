@@ -1,0 +1,23 @@
+# On linux or MacOS, if you are *not* installing conda, you should install these packages:
+# apt install build-essential python3.11-dev swig
+# (replace 3.11 with your python version; for instance python3.12-dev.
+
+name: thesisenv # It is activated by `conda activate thesisenv`
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python
+  - gymnasium[box2d]>=1.0.0
+  - pytorch
+  - sympy
+  - tqdm
+  - seaborn
+  - pillow
+  - scikit-learn
+  - matplotlib
+  - requests
+  - qtpy # Try pyqt, pyqt6 on other platforms.
+  - pygame
+  - numpy>=2.0.1
+  - pip

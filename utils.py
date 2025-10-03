@@ -2,6 +2,8 @@ import os, glob, csv
 import pickle
 import numpy as np
 from collections import namedtuple
+import matplotlib.pyplot as plt
+import pandas as pd
 
 fields = ('time', 'state', 'action', 'reward')
 Trajectory = namedtuple('Trajectory', fields + ("env_info",))
@@ -85,7 +87,6 @@ def average_trajectories(trajectories):
     tavg = Trajectory(**dd, time=tlong.time, env_info=[])
     return tavg
 
-
 def experiment_load(experiment_name, exclude_empty=True):
     files = list(filter(os.path.isdir, glob.glob(experiment_name + "/*")))
     if exclude_empty:
@@ -119,3 +120,55 @@ def experiment_load(experiment_name, exclude_empty=True):
             trajectories = None
         values.append( (stats, trajectories, recent) )
     return values
+
+#%% Common functions
+def log_transform(y):
+    # Does not transform nicely for low absolute values.
+    def _log(x):
+        if x > 0:
+            return np.log(x)
+        elif x < 0:
+            return -np.log(-x)
+        else:
+            return 0
+    if type(y) == pd.DataFrame:
+        y[y.columns[0]] = [_log(x) for x in y[y.columns[0]]]
+        return y
+    else:
+        return [_log(x) for x in y]
+
+def delog_transform(y):
+    # Does not transform nicely for low absolute values.
+    def _delog(x):
+        if x > 0:
+            return np.exp(x)
+        elif x < 0:
+            return -np.exp(-x)
+        else:
+            return 0
+    if type(y) == pd.DataFrame:
+        y[y.columns[0]] = [_delog(x) for x in y[y.columns[0]]]
+        return y
+    else:
+        return [_delog(x) for x in y]
+
+def laplace_rnd(mu, sigma, x):
+    return mu - sigma * np.sign(x) * np.log(1 - 2 * np.abs(x))
+
+def trigo_fit(t, b1, b2, b3, b4, b5, b6, b7):
+    """
+    Trigonometric seasonal fitting function.
+    
+    Parameters:
+    - beta: list or array of coefficients [b1, b2, b3, b4, b5, b6, b7]
+    - t: array-like time values
+    
+    Returns:
+    - y: numpy array of fitted values
+    """
+    y = (
+        b1 * np.cos(2 * np.pi * t * b2 + b6) +
+        b3 * np.sin(4 * np.pi * t * b4 + b7) +
+        b5
+    )
+    return np.asarray(y, dtype=float).flatten()  # Equivalent to MATLAB's y'
