@@ -1,7 +1,5 @@
 import gymnasium as gym
 import numpy as np
-import pandas as pd
-import os
 from RFP_initialization import RenewableFuelPlant, make_rfp
 
 class RFPEnv(gym.Env):
@@ -238,5 +236,3 @@ def make_rfp_env(normalize:bool=True):
     rfp = make_rfp()
     env = RFPEnv(rfp, normalize=normalize)
     return env
-    
-

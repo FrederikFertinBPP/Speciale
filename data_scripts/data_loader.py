@@ -256,9 +256,9 @@ def historical_price_inspection(data_object : HistoricalData):
     plt.savefig('documentation/historical_daily_price_duration_curves.png')
     plt.close()
 
-if __name__ == "__main__":
-    #%% Load historical data
-    start   = pd.Timestamp('20150101', tz='UTC')
-    end     = pd.Timestamp('20221231', tz='UTC')
-    data_object = HistoricalData(start=start, end=end, country_code='PT', server='ENTSOE')
-    historical_price_inspection(data_object)
+#%% Main example
+#     #%% Load historical data
+#     start   = pd.Timestamp('20150101', tz='UTC')
+#     end     = pd.Timestamp('20221231', tz='UTC')
+#     data_object = HistoricalData(start=start, end=end, country_code='PT', server='ENTSOE')
+#     historical_price_inspection(data_object)
