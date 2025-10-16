@@ -1,0 +1,4 @@
+vthesisenv/
+__pycache__/
+*.pyc
+models/ts_models

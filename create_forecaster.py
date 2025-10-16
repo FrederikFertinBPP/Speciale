@@ -8,7 +8,9 @@ data_object = HistoricalData(start=start, end=end, country_code='PT', server='EN
 
 #%% Forecasting setup
 forecaster = DataForecaster(data_object,
-                            cache_id="test1",
-                            verbose=True,
+                            cache_id="v2",
+                            verbose=False, # Takes under 10 minutes to create, set verbose equals True to see progress, but know that verbose=True for the unpickled object.
+                            cache_replace=True,
                             )
-forecaster.build_simulation_models(hmm=False, to_pickle=True)
+forecaster.build_simulation_models(to_pickle=True)
+print("Data forecaster and models built and pickled.")

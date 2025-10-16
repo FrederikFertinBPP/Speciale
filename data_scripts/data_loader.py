@@ -3,7 +3,7 @@ import numpy as np
 import os
 import json
 import requests
-from utils import cache_exists, cache_read, cache_write, log_transform, delog_transform
+from common_scripts.utils import log_transform, delog_transform
 from entsoe import EntsoePandasClient
 from astral import LocationInfo
 from astral.sun import sun
@@ -24,7 +24,7 @@ class HistoricalData:
                  country_code    :str       = "PT",
                  server     :str            = "ENTSOE",
                  ):
-        self.filepath = 'Historical Data/clean_dataframes/' +'server-' + server + 'country-' + country_code + "_".join(priceArea) + str(start).split(' ')[0] + 'to' + str(end).split(' ')[0] + '.csv'
+        self.filepath = 'historical_data/clean_dataframes/' +'server-' + server + 'country-' + country_code + "_".join(priceArea) + str(start).split(' ')[0] + 'to' + str(end).split(' ')[0] + '.csv'
         self.country = country_code
         self.start, self.end = start, end
         self.server, self.limit, self.priceArea = server, limit, priceArea
@@ -62,7 +62,7 @@ class HistoricalData:
 
     def load_capacity_data(self):
         # Taken from ENTSO-E Transparency Platform (does not match generation data):
-        # directory = 'Historical Data'
+        # directory = 'historical_data'
         # file = self.country + '_installed_capacities.csv'
         # filepath = directory + '/' + file
         # df = pd.read_csv(filepath)
@@ -73,13 +73,13 @@ class HistoricalData:
         # years = [int(y.split(" ")[0]) for y in solar_caps.columns[1:]]
         # self.caps = pd.DataFrame(index=years,
         #                          data={'wind' : w_c.astype(float), 'solar' : s_c.astype(float)})
-        df = np.transpose(pd.read_excel('Historical Data/eurostat_capacities.xlsx', sheet_name='Wind', skiprows=9, skipfooter=3))
+        df = np.transpose(pd.read_excel('historical_data/eurostat_capacities.xlsx', sheet_name='Wind', skiprows=9, skipfooter=3))
         df.columns = df.iloc[0]
         df = df.iloc[1:,1:]
         df = df.set_index(df.index.astype(int))
         years = df.index
         w_c = df['Portugal'].values.astype(float)
-        df = np.transpose(pd.read_excel('Historical Data/eurostat_capacities.xlsx', sheet_name='Solar', skiprows=9, skipfooter=3))
+        df = np.transpose(pd.read_excel('historical_data/eurostat_capacities.xlsx', sheet_name='Solar', skiprows=9, skipfooter=3))
         df.columns = df.iloc[0]
         df = df.iloc[1:,1:]
         df = df.set_index(df.index.astype(int))
