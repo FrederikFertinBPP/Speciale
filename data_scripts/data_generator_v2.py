@@ -1,5 +1,5 @@
 #%% Initialization
-from data_scripts.data_loader import HistoricalData
+from data_scripts.data_loader import DataLoader
 from common_scripts.utils import cache_exists, cache_read, cache_write, log_transform, delog_transform, laplace_rnd
 from common_scripts.RFP_initialization import RenewableFuelPlant
 
@@ -129,11 +129,11 @@ class SimulationTool:
         # self.last_state['endog_arima'] = time_series.iloc[-24:]
         return arima_model
 
-    def _arima_simulate(self, horizon = 8760, realize = False):
+    def _arima_simulate(self, horizon = 8760, realize = False, repetitions=None):
         if self.arima_model is not None:
-            sim = self.arima_model.arima_res_.simulate(nsimulations=horizon, anchor='end').values
+            sim = self.arima_model.arima_res_.simulate(nsimulations=horizon, anchor='end', repetitions=repetitions).values # We can specify repetitions to save time when doing multiple simulations (realize whould be false)
             if realize:
-                self.arima_model.arima_res_ = self.arima_model.arima_res_.append(sim) # Consider using extend if this is too slow.
+                self.arima_model.arima_res_ = self.arima_model.arima_res_.extend(sim, )
             return sim
         else:
             raise("Cannot simulate arima process before fitting the model.")
@@ -245,11 +245,11 @@ class PriceSimulationTool(SimulationTool):
         self.train_data = self.forecaster.train_data.copy() # Historical price data
         residuals = self.train_data[[self.price_tag]]
 
+        self.max_historical, self.min_historical = np.max(residuals), np.min(residuals)
+
         residuals, self.wss_model = self.WSS_price_regression(residuals)
 
         residuals, self.trend_model = self._del_trend(residuals)
-        
-        self.max_historical, self.min_historical = np.max(residuals), np.min(residuals)
 
         residuals, self.monthly_avg = self._del_annual_cycle(residuals)
         residuals, self.weekday_avg, self.weekend_avg = self._del_weekday_and_weekend_pattern(residuals)
@@ -380,8 +380,6 @@ class PriceSimulationTool(SimulationTool):
         df.loc[time_info.is_weekend, self.price_tag] += df.loc[time_info.is_weekend].index.hour.map(self.weekend_avg)
         df.loc[time_info.is_weekday, self.price_tag] += df.loc[time_info.is_weekday].index.hour.map(self.weekday_avg)
         df[self.price_tag] += df.index.month.map(self.monthly_avg[self.price_tag])
-
-        df[self.price_tag] = np.clip(df[self.price_tag], self.min_historical, self.max_historical)
         
         # Add trend effect on prices:
         u_hours = pd.DataFrame(index=df.index, data={'timestamp': [h.timestamp() - self.forecaster.t_zero for h in df.index]}) # Convert to Unix time
@@ -400,6 +398,8 @@ class PriceSimulationTool(SimulationTool):
         # Add merit order effect on prices:
         df[self.price_tag] += self.wss_model.predict(X)[:,0]
 
+        df[self.price_tag] = np.clip(df[self.price_tag], self.min_historical, self.max_historical)
+
         return df[[self.price_tag]]
 
 
@@ -415,14 +415,14 @@ class RenewablesSimulationTool(SimulationTool):
     
     def _del_capacity_trend(self, df_):
         df = df_.copy()
-        year_index          = df.index.year
-        yearly_caps         = year_index.map(self.caps[self.vre_tag])
+        year_month_index          = df.index.tz_localize(None).to_period('M')
+        yearly_caps         = year_month_index.map(self.caps[self.vre_tag])
         df.loc[:,self.vre_tag]    = df[self.vre_tag] / yearly_caps
         if df[self.vre_tag].max() > 1.0:
             print(f"Warning: {self.vre_tag} capacity factor larger than 1.0 detected in training data.")
             df = df_.copy() # Revert to original data
-            yearly_max = df.groupby(year_index).max()
-            yearly_caps = year_index.map(yearly_max[self.vre_tag])
+            yearly_max = df.groupby(year_month_index).max()
+            yearly_caps = year_month_index.map(yearly_max[self.vre_tag])
             df.loc[:,self.vre_tag]    = df[self.vre_tag] / yearly_caps
         return df
 
@@ -502,52 +502,6 @@ class SolarSimulationTool(RenewablesSimulationTool):
         # Step 5: Fit arima model to daily max residual data.
         self.arima_model = self._fit_arima_model(self.residuals, order=(2,0,0))
 
-    def simulate(self, capacity, year=2023):
-        # Create hourly index for leap year
-        hourly_index = pd.to_datetime(pd.date_range(f'{year}-01-01', f'{year}-12-31 23:00', freq='h'), utc=True)
-        day_index    = pd.date_range(f'{year}-01-01', f'{year}-12-31 23:00', freq='d')
-        n_hours = len(hourly_index)
-        n_days  = int(n_hours/24)
-
-        # Reverse Step 5: Simulate daily maximum values of solar production.
-        sim_daily_max = pd.DataFrame(index=day_index, data={self.vre_tag : self._arima_simulate(n_days).values})
-
-        # Rev. Step 4: Multiply simulated values with monthly std of maximums.
-        impact = sim_daily_max.index.month.map(self.monthly_std_of_max[self.vre_tag])
-        sim_daily_max[self.vre_tag] = sim_daily_max[self.vre_tag] * impact
-
-        # Rev. Step 3: Multiply daily max by max mean hourly value for each month.
-        impact = sim_daily_max.index.month.map(self.monthly_mean_max[self.vre_tag])
-        sim_daily_max[self.vre_tag] += self.mu_daily_max
-
-        # Rev. Step 2: Go from daily max to hourly profiles
-        hourly_variation = self.hourly_arima_model.arima_res_.simulate(nsimulations=n_hours).values
-        profile = pd.DataFrame(index=hourly_index, data={self.vre_tag : hourly_variation})
-        for month in range(1,13):
-            hourly_means = self.hourly_monthly_mean_profiles.loc[month]
-            hourly_stds  = self.hourly_monthly_std_profiles.loc[month]
-            hourly_min  = self.hourly_monthly_min_profiles.loc[month]
-            hourly_max  = self.hourly_monthly_max_profiles.loc[month]
-            ix = profile.index.month == month
-            hours_of_month = profile.index[ix]
-            day_profile = [np.clip(hourly_means.loc[timestamp.hour,self.vre_tag] * sim_daily_max.loc[pd.to_datetime(timestamp.date()),self.vre_tag]
-                                   + profile.loc[timestamp, self.vre_tag] * hourly_stds.loc[timestamp.hour,self.vre_tag],
-                                  hourly_min.loc[timestamp.hour,self.vre_tag], hourly_max.loc[timestamp.hour,self.vre_tag]) for timestamp in hours_of_month]
-            profile.loc[ix, self.vre_tag] = day_profile
-        
-        if self.documentation:
-            data = self.forecaster.train_data[[self.vre_tag]]
-            df_hist = self._del_capacity_trend(data)
-            plt.plot(np.sort(profile[self.vre_tag]), color='red')
-            for year in df_hist.index.year.unique():
-                plt.plot(np.sort(df_hist.loc[df_hist.index.year==year, self.vre_tag]), color='blue')
-            plt.savefig(f'documentation/{self.forecaster.plot_dir}solar_load_duration_curves.png')
-            plt.close()
-
-        profile[self.vre_tag] *= capacity
-
-        return profile
-
     def _simulate_cf(self, hourly_index: pd.DatetimeIndex, realize=False, forecasting = False):
         day_index    = pd.date_range(hourly_index[0], hourly_index[-1], freq='d')
 
@@ -572,7 +526,7 @@ class SolarSimulationTool(RenewablesSimulationTool):
         else:
             sim_hourly_variation = self.hourly_arima_model.arima_res_.simulate(nsimulations=n_hours).values
             if realize:
-                self.hourly_arima_model.arima_res_ = self.hourly_arima_model.arima_res_.append(sim_hourly_variation)
+                self.hourly_arima_model.arima_res_ = self.hourly_arima_model.arima_res_.extend(sim_hourly_variation, )
 
         profile = pd.DataFrame(index=hourly_index, data={self.vre_tag : sim_hourly_variation})
         for month in profile.index.month.unique():
@@ -596,7 +550,11 @@ class SolarSimulationTool(RenewablesSimulationTool):
                 plt.plot(np.sort(df_hist.loc[df_hist.index.year==year, self.vre_tag]), color='blue')
             plt.savefig(f'documentation/{self.forecaster.plot_dir}solar_load_duration_curves.png')
             plt.close()
+        
         return profile
+
+    def simulate(self, hourly_index: pd.DatetimeIndex):
+        return self._simulate_cf(hourly_index=hourly_index)
 
     def forecast(self, hourly_index: pd.DatetimeIndex):
         return self._simulate_cf(hourly_index=hourly_index, forecasting=True)
@@ -673,13 +631,15 @@ class WindSimulationTool(RenewablesSimulationTool):
         self.min_historical_production = np.min(capacity_factors)
         self.max_historical_production = np.max(capacity_factors)
 
-        # Remove effect of solar on wind profile
-        residuals, self.solar_reg_model = self.solar_wind_regression(capacity_factors, capacity_factors_solar)
+        deseasonalized = self._deseasonalise(capacity_factors)
 
-        df = self._deseasonalise(residuals)
+        # Remove effect of solar on wind profile (https://www.sciencedirect.com/science/article/pii/S0960148115303591)
+        residuals, self.solar_reg_model = self.solar_wind_regression(deseasonalized, capacity_factors_solar)
 
         # Step X:
-        if self.documentation: plot_acf(df)
+        if self.documentation: plot_acf(residuals)
+
+        df = residuals
 
         prev_df = df.shift(1).fillna(df.iloc[0][self.vre_tag])
         diff = df - prev_df
@@ -769,6 +729,7 @@ class WindSimulationTool(RenewablesSimulationTool):
         pfParaMode : ndarray
             Coefficients of 1st-degree polynomial fit for mode values.
         """
+        df.index = list(range(len(df)))
         intervals = np.arange(min(df[self.vre_tag]), max(df[self.vre_tag]), (max(df[self.vre_tag])-min(df[self.vre_tag]))/20)
         centres = np.zeros(len(intervals)-1)
         centres[0] = min(df[self.vre_tag])
@@ -997,96 +958,6 @@ class WindSimulationTool(RenewablesSimulationTool):
             sim_cf[t] = sim_cf[t-1] + delta
         return sim_cf, deltas
 
-    def simulate(self, capacity, solar_cf_profile, year=2023, save_last_obs=False):
-        # Create hourly index for year
-        hourly_index = pd.to_datetime(pd.date_range(f'{year}-01-01', f'{year}-12-31 23:00', freq='h'), utc=True)
-        horizon      = len(hourly_index)
-        sim_cf       = np.zeros(horizon) # Simulated capacity factors
-        diff_direction = np.zeros(horizon)
-        # First simulate self.mov_avg_lag laplace distributed wind values for the differences before we can bootstrap.
-        sim_diff = np.random.laplace(self.mu_laplace, self.sigma_laplace, size=self.ma_lag)
-        # We start the simulation from the last observation in the training data. Not important for a year sim, but maybe for a day.
-        sim_cf[0]= self.last_observation + sim_diff[0]
-        for t in range(1, self.ma_lag):
-            sim_cf[t] = sim_cf[t-1] + sim_diff[t]
-        diff_direction[:self.ma_lag] = np.sign(sim_diff).astype(int)
-        previous_diff_direction = diff_direction[self.ma_lag-1] # We start the simulation from the last observation in the training data.
-        # Simulate the rest of the time series:
-        for t in range(self.ma_lag, horizon):
-            if (diff_direction[t] == 0 or
-                (sim_cf[t-1] <= self.p5_deseason_observation and diff_direction[t] == -1) or 
-                (sim_cf[t-1] >= self.p98_deseason_observation and diff_direction[t] == 1)):
-                current_domain = np.argwhere(self.domains <= sim_cf[t-1])[-1][0]
-                if previous_diff_direction == 1:
-                    p = self.neg_int_length_distributions[:,current_domain]
-                else:
-                    p = self.pos_int_length_distributions[:,current_domain]
-                interval_length = np.random.choice(range(len(p)), p=p)
-                diff_direction[t:min(t+interval_length, horizon)] = -previous_diff_direction
-                previous_diff_direction *= -1
-            moving_average = np.mean(sim_cf[t-self.ma_lag:t])
-            direction      = diff_direction[t-self.ma_lag]
-            if direction == 1:
-                mean = self.pol_model_pos(moving_average)
-            else:
-                mean = self.pol_model_neg(moving_average)
-            mode  = self.pol_model_mode(moving_average)
-            delta = direction * np.random.exponential(max(self.sigma_laplace/2, mean)) #+ mode
-            if direction == 1:
-                delta = max(delta, 0)
-            else:
-                delta = min(delta, 0)
-            sim_cf[t] = sim_cf[t-1] + delta
-        
-        if save_last_obs:
-            self.last_observed_diff = delta
-            self.last_observation   = sim_cf[-1]
-
-        profile = pd.DataFrame(index=hourly_index, data={self.vre_tag: sim_cf})
-        # Add daily profile and subtract mean
-        profile[self.vre_tag] += profile.index.hour.map(self.daily_profile) #- np.mean(sim_cf)#self.mean_cf
-        # Monthly Seasonalisation using p10 and p90 quantiles to stretch and move the simulated data.
-        use_dogans_reseasoning = True
-        if self.generate_weather_years:
-            # weather_year = np.random.choice(self.weather_years)
-            # monthly_move_factor = self.monthly_move_factors.loc[self.monthly_move_factors.index.year==weather_year]
-            # monthly_stretch_factor = self.monthly_stretch_factors.loc[self.monthly_stretch_factors.index.year==weather_year]
-            # monthly_move_factor.index = monthly_move_factor.index.month
-            # monthly_stretch_factor.index = monthly_stretch_factor.index.month
-            monthly_stretch_factor = np.clip(np.random.normal(loc = self.avg_monthly_stretch, scale=self.std_monthly_stretch),
-                                          self.avg_monthly_stretch - 2 * self.std_monthly_stretch,
-                                          self.avg_monthly_stretch + 2 * self.std_monthly_stretch)
-            monthly_move_factor = np.clip(np.random.normal(loc = self.avg_monthly_move, scale=self.std_monthly_move),
-                                          self.avg_monthly_move - 2 * self.std_monthly_move,
-                                          self.avg_monthly_move + 2 * self.std_monthly_move)
-            profile[self.vre_tag] = (profile[self.vre_tag] - profile.index.month.map(monthly_move_factor)) / profile.index.month.map(monthly_stretch_factor)
-        elif use_dogans_reseasoning:
-            p10_sim, p90_sim = np.quantile(profile[self.vre_tag], [0.1, 0.9])
-            stretch_factor   = profile.index.month.map((self.avg_monthly_p90s - self.avg_monthly_p10s)[self.vre_tag]) / (p90_sim - p10_sim)
-            move_factor      = -p10_sim * stretch_factor + profile.index.month.map(self.avg_monthly_p10s[self.vre_tag])
-            profile[self.vre_tag] = profile[self.vre_tag] * stretch_factor + move_factor
-        else:
-            profile[self.vre_tag] = (profile[self.vre_tag] - profile.index.month.map(self.avg_monthly_move)) / profile.index.month.map(self.avg_monthly_stretch)
-        
-        profile[self.vre_tag] += self.solar_reg_model.predict(solar_cf_profile)[:,0]
-
-        # Clip to historical observations with exponential noise around max.
-        profile[self.vre_tag] += (profile[self.vre_tag] > self.max_historical_production) * ((self.max_historical_production-profile[self.vre_tag]) - np.random.exponential(abs(self.pol_model_neg(self.max_historical_production)),size=len(profile)))
-        profile[self.vre_tag] += (profile[self.vre_tag] < self.min_historical_production) * ((self.min_historical_production-profile[self.vre_tag]) + np.random.exponential(abs(self.pol_model_pos(self.min_historical_production)),size=len(profile)))
-
-        if self.documentation:
-            data = self.forecaster.train_data[[self.vre_tag]]
-            df_hist = self._del_capacity_trend(data)
-            plt.plot(np.sort(profile[self.vre_tag]), color='red')
-            for year in df_hist.index.year.unique():
-                plt.plot(np.sort(df_hist.loc[df_hist.index.year==year, self.vre_tag]), color='blue')
-            plt.savefig(f'documentation/{self.forecaster.plot_dir}wind_load_duration_curves.png')
-            plt.close()
-        
-        profile *= capacity
-
-        return profile
-    
     def _simulate_cf(self, hourly_index:pd.DatetimeIndex, solar_cf_profile:pd.DataFrame=None, realize=False, forecasting = False):
         sim_cf, deltas = self._stochastic_process_simulation(horizon=len(hourly_index), forecasting=forecasting)
         # jit implementation: (not significantly faster)
@@ -1099,6 +970,9 @@ class WindSimulationTool(RenewablesSimulationTool):
             self.recent_data['differences']  = deltas[-self.ma_lag:]
 
         profile = pd.DataFrame(index=hourly_index, data={self.vre_tag: sim_cf[self.ma_lag:]})
+
+        # Add solar effect on wind
+        profile[self.vre_tag] += self.solar_reg_model.predict(solar_cf_profile)[:,0]
         # Add daily profile and subtract mean
         profile[self.vre_tag] += profile.index.hour.map(self.daily_profile) #- np.mean(sim_cf)#self.mean_cf
         # Monthly Seasonalisation using p10 and p90 quantiles to stretch and move the simulated data.
@@ -1123,8 +997,6 @@ class WindSimulationTool(RenewablesSimulationTool):
             profile[self.vre_tag] = profile[self.vre_tag] * stretch_factor + move_factor
         else:
             profile[self.vre_tag] = (profile[self.vre_tag] - profile.index.month.map(self.avg_monthly_move)) / profile.index.month.map(self.avg_monthly_stretch)
-        
-        profile[self.vre_tag] += self.solar_reg_model.predict(solar_cf_profile)[:,0]
 
         # Clip to historical observations with exponential noise around max.
         profile[self.vre_tag] += (profile[self.vre_tag] > self.max_historical_production) * ((self.max_historical_production-profile[self.vre_tag]) - np.random.exponential(abs(self.pol_model_neg(self.max_historical_production)),size=len(profile)))
@@ -1140,6 +1012,9 @@ class WindSimulationTool(RenewablesSimulationTool):
             plt.close()
 
         return profile
+
+    def simulate(self, hourly_index, solar_cf_profile:pd.DataFrame=None):
+        return self._simulate_cf(hourly_index=hourly_index, solar_cf_profile=solar_cf_profile)
 
     def forecast(self, hourly_index:pd.DatetimeIndex, solar_cf_profile:pd.DataFrame=None):
         """ Forecasting wind does not change anything from just simulating it. """
@@ -1176,7 +1051,7 @@ class DataForecaster:
     _tags = RenewableFuelPlant.uncertainties
 
     def __init__(self,
-                 database:HistoricalData  = None,
+                 database:DataLoader = None,
                  price_tag = 'price',
                  wind_tag = 'wind',
                  solar_tag = 'solar',
@@ -1221,8 +1096,12 @@ class DataForecaster:
             self.cache_id, self.cache_replace = cache_id, cache_replace
             self.create_train_test_data()
     
-    def unpickle(self):
+    def unpickle(self, documentation=False):
         if hasattr(self, 'unpickled'):
+            self.unpickled.price_model.documentation = documentation
+            self.unpickled.wind_model.documentation = documentation
+            self.unpickled.solar_model.documentation = documentation
+            self.unpickled.documentation = documentation
             return self.unpickled
         else:
             raise AttributeError("No unpickled object found. Please initialize with from_pickle=True.")
@@ -1243,19 +1122,28 @@ class DataForecaster:
     def create_train_test_data(self):
         ## Train and test split and y (prices) and X (renewables).
         self.train_data, self.test_data = pm.model_selection.train_test_split(self.data, test_size=8760) # A full year of test data, should be at least two years of data.
-        # self.y_train, self.y_test = self.train_data[[self.price_tag]], self.test_data[[self.price_tag]]        
+        # self.y_train, self.y_test = self.train_data[[self.price_tag]], self.test_data[[self.price_tag]]
         # self.X_train, self.X_test = self.train_data[feature_tags], self.test_data[feature_tags]
         self.t_zero = self.train_data.index[0].timestamp() # To be used when fitting trend and later on when reapplying trend.
         self.t_init =  self.train_data.index[-1] + pd.Timedelta(1, 'hour')
 
-    def simulate(self, year, caps, n_sims=1):
+    def set_seed(self, seed):
+        self.seed = seed
+        np.random.seed(self.seed)
+
+    def simulate(self, year, n_sims=1):
+        hourly_index = pd.to_datetime(pd.date_range(str(year), str(year+1), freq='h'), utc=True)[:-1]
         sims = []
         for sim in tqdm(range(n_sims), disable=not(self.verbose)):
-            solar_simulation = self.solar_model.simulate(capacity = caps.loc[year, self.solar_tag], year=year)
-            solar_simulation_cf = self.solar_model._del_capacity_trend(solar_simulation)
-            wind_simulation  = self.wind_model.simulate(capacity  = caps.loc[year, self.wind_tag], solar_cf_profile=solar_simulation_cf,  year=year)
-            # wind_simulation = self.simulate_wind(caps.loc[year, self.wind_tag], horizon=len(solar_simulation))
-            price_simulation = self.price_model.simulate(wind_simulation, solar_simulation, year=year)
+            solar_simulation_cf = self.solar_model.simulate(hourly_index=hourly_index)
+            wind_simulation_cf  = self.wind_model.simulate(hourly_index=hourly_index, solar_cf_profile=solar_simulation_cf)
+            year_month_index = hourly_index.tz_localize(None).to_period('M')
+            solar_caps = year_month_index.map(self.database.caps[self.solar_tag])
+            wind_caps = year_month_index.map(self.database.caps[self.wind_tag])
+            solar_simulation = solar_simulation_cf[self.solar_tag] * solar_caps 
+            wind_simulation = wind_simulation_cf[self.wind_tag] * wind_caps
+            vre_profiles = pd.DataFrame(index=hourly_index, data={self.solar_tag : solar_simulation , self.wind_tag  : wind_simulation})
+            price_simulation = self.price_model.simulate(vre_profiles)[self.price_tag]
             sims.append({self.wind_tag : wind_simulation, self.solar_tag : solar_simulation, self.price_tag : price_simulation})
         return sims
 
@@ -1276,8 +1164,9 @@ class DataForecaster:
     def simulate_year_ahead(self, start:pd.Timestamp, n_sims=3, deterministic:bool = False):
         end = start + relativedelta(years=+1) - pd.Timedelta(1, 'hour')
         hourly_index = pd.to_datetime(pd.date_range(start, end, freq='h'), utc=True)
-        solar_capacities = hourly_index.year.map(self.database.caps[self.solar_tag])
-        wind_capacities = hourly_index.year.map(self.database.caps[self.wind_tag])
+        year_month_index = hourly_index.tz_localize(None).to_period('M')
+        solar_capacities = year_month_index.map(self.database.caps[self.solar_tag])
+        wind_capacities = year_month_index.map(self.database.caps[self.wind_tag])
         t_s = time()
         sims = [self._simulate_year_ahead_single_run(hourly_index, solar_capacities, wind_capacities) for _ in range(n_sims)]
         print(f"Simulated {n_sims} year aheads in {time() - t_s} seconds.")
@@ -1306,6 +1195,16 @@ class DataForecaster:
             sims = sims[self._tags]
         return sims
 
+    def simulate_period(self, start:pd.Timestamp, end:pd.Timestamp, n_sims=1):
+        hourly_index = pd.to_datetime(pd.date_range(start, end, freq='h'), utc=True)
+        year_month_index = hourly_index.tz_localize(None).to_period('M')
+        solar_capacities = year_month_index.map(self.database.caps[self.solar_tag])
+        wind_capacities = year_month_index.map(self.database.caps[self.wind_tag])
+        t_s = time()
+        sims = [self._simulate_year_ahead_single_run(hourly_index, solar_capacities, wind_capacities) for _ in range(n_sims)]
+        print(f"Simulated {n_sims} rest-of-year in {time() - t_s} seconds.")
+        return sims
+
     def realize_vre(self, start:pd.Timestamp, end:pd.Timestamp):
         """ Simulates (and then assumes that this is the future that is realized).
         self.solar_model and self.wind_model is updated with the realized data, which is appended to the existing model data. """
@@ -1316,8 +1215,9 @@ class DataForecaster:
 
     def realize_prices(self, start:pd.Timestamp, end:pd.Timestamp):
         hourly_index = pd.to_datetime(pd.date_range(start, end, freq='h'), utc=True)
-        solar_capacities = hourly_index.year.map(self.database.caps[self.solar_tag])
-        wind_capacities = hourly_index.year.map(self.database.caps[self.wind_tag])
+        year_month_index = hourly_index.tz_localize(None).to_period('M')
+        solar_capacities = year_month_index.map(self.database.caps[self.solar_tag])
+        wind_capacities = year_month_index.map(self.database.caps[self.wind_tag])
         if (self.solar_realization_cf is None) or (self.wind_realization_cf is None):
             raise (SyntaxError, "Need to realize VRE before we can realize prices.")
         else:
@@ -1328,29 +1228,40 @@ class DataForecaster:
             prices = self.price_model.realize(vre_profiles)
             return prices
 
-    def forecast(self, start:pd.Timestamp, end:pd.Timestamp, n_forecasts:int = 10, deterministic:bool = False):
+    def forecast(self, start:pd.Timestamp, end:pd.Timestamp, n_forecasts:int = 10, deterministic:bool = False, simulate_prices:bool = False):
         """ Call to forecast the VRE and prices from the current time stamp of the price models.
         The VRE is likely determined for the first time period.
         If we only ask for one forecast, then call forecast, otherwise simulate possible outcomes. """
         hourly_index = pd.to_datetime(pd.date_range(start, end, freq='h'), utc=True)
-        solar_capacities = hourly_index.year.map(self.database.caps[self.solar_tag])
-        wind_capacities = hourly_index.year.map(self.database.caps[self.wind_tag])
+        year_month_index = hourly_index.tz_localize(None).to_period('M')
+        solar_capacities = year_month_index.map(self.database.caps[self.solar_tag])
+        wind_capacities = year_month_index.map(self.database.caps[self.wind_tag])
         df_structure = pd.DataFrame(index=hourly_index, columns=[self.price_tag, self.solar_tag, self.wind_tag])
         if (self.solar_realization_cf is not None) and (self.wind_realization_cf is not None):
             vre_forecast_index = pd.to_datetime(pd.date_range(self.solar_realization_cf.index[-1] + pd.Timedelta(1, 'hour'), end, freq='h'), utc=True)
         else:
             vre_forecast_index = hourly_index
         forecasts = []
-        for _ in range(n_forecasts):
+        solar_forecast_cf, wind_forecast_cf = None, None
+        for ix in range(n_forecasts):
             df    = df_structure.copy()
-            solar_forecast_cf = self.solar_model.forecast(hourly_index=vre_forecast_index)
-            wind_forecast_cf  = self.wind_model.forecast(hourly_index=vre_forecast_index, solar_cf_profile=solar_forecast_cf)
-            solar_production  = pd.concat([self.solar_realization_cf[self.solar_tag], solar_forecast_cf[self.solar_tag]]) * solar_capacities.values
-            wind_production   = pd.concat([self.wind_realization_cf[self.wind_tag], wind_forecast_cf[self.wind_tag]]) * wind_capacities.values
-            price_forecast    = self.price_model.forecast(pd.DataFrame(index=hourly_index, data = {self.solar_tag: solar_production, self.wind_tag: wind_production}))
-            df.loc[hourly_index, self.solar_tag] = pd.concat([self.solar_realization_cf[self.solar_tag], solar_forecast_cf[self.solar_tag]])
-            df.loc[hourly_index, self.wind_tag]  = pd.concat([self.wind_realization_cf[self.wind_tag], wind_forecast_cf[self.wind_tag]])
-            df.loc[hourly_index,       self.price_tag] = price_forecast[self.price_tag]
+            if len(vre_forecast_index) > 0:
+                solar_forecast_cf = self.solar_model.forecast(hourly_index=vre_forecast_index)
+                wind_forecast_cf  = self.wind_model.forecast(hourly_index=vre_forecast_index, solar_cf_profile=solar_forecast_cf)[self.wind_tag]
+                solar_forecast_cf = solar_forecast_cf[self.solar_tag]
+            elif len(vre_forecast_index) > 0 and ix > 0:
+                solar_forecast_cf = self.solar_model.simulate(hourly_index=vre_forecast_index)
+                wind_forecast_cf  = self.wind_model.simulate(hourly_index=vre_forecast_index, solar_cf_profile=solar_forecast_cf)[self.wind_tag]
+                solar_forecast_cf = solar_forecast_cf[self.solar_tag]
+            solar_production  = pd.concat([self.solar_realization_cf[self.solar_tag], solar_forecast_cf]) * solar_capacities.values
+            wind_production   = pd.concat([self.wind_realization_cf[self.wind_tag], wind_forecast_cf]) * wind_capacities.values
+            if simulate_prices and ix > 0: # Useful only if we simulate more scenarios where the effect of extreme prices might be desirable to include
+                price_forecast    = self.price_model.simulate(pd.DataFrame(index=hourly_index, data = {self.solar_tag: solar_production.values, self.wind_tag: wind_production.values}))
+            else:
+                price_forecast    = self.price_model.forecast(pd.DataFrame(index=hourly_index, data = {self.solar_tag: solar_production.values, self.wind_tag: wind_production.values}))
+            df.loc[hourly_index, self.solar_tag] = pd.concat([self.solar_realization_cf[self.solar_tag], solar_forecast_cf])
+            df.loc[hourly_index, self.wind_tag]  = pd.concat([self.wind_realization_cf[self.wind_tag], wind_forecast_cf])
+            df.loc[hourly_index, self.price_tag] = price_forecast[self.price_tag]
             forecasts.append(df)
         if deterministic: # We average the simulated futures instead of returning all of them. Will likely ruin the crosscorrelation.
             wind_forecast  = np.mean(np.asarray([df[self.wind_tag].values for df in forecasts]), axis=1)
@@ -1366,10 +1277,8 @@ class DataForecaster:
         simulated_data = [sim[resource] for sim in simulations]
         year = simulated_data[0].index.year[0]
         if resource == 'price':
-            cap = 1
             ylabel="[€/MWh]"
         else:
-            cap = self.database.caps.loc[year, resource]
             ylabel="MW"
         fig, axes = plt.subplots(3, 4, figsize=(20, 15), sharey=True)
         axes = axes.flatten()
@@ -1380,15 +1289,14 @@ class DataForecaster:
         for i, month in enumerate(range(1, 13)):
             monthly_data = real_data[real_data.index.month == month]
             sorted_ = np.sort(monthly_data.values)
-            mean_monthly = np.mean(monthly_data.values)/cap
-            sim_means = [np.mean(sim[sim.index.month == month].values)/cap for sim in simulated_data]
+            mean_monthly = np.mean(monthly_data.values)
+            sim_means = [np.mean(sim[sim.index.month == month].values) for sim in simulated_data]
             ax = axes[i]
             for sim in simulated_data:
-                d = sim[resource]
-                m_d = d[d.index.month == month]
+                m_d = sim[sim.index.month == month]
                 # ax.plot(np.sort(m_d.values), color='blue', alpha=0.4)
             # Draw confidence intervals
-            mtx = np.asarray([np.sort(sim.loc[sim.index.month == month, resource].values).reshape(-1) for sim in simulated_data])
+            mtx = np.asarray([np.sort(sim.loc[sim.index.month == month].values).reshape(-1) for sim in simulated_data])
             p_low = np.percentile(mtx, 5, axis=0)
             p_high = np.percentile(mtx, 95, axis=0)
             ax.fill_between(range(len(p_low)), p_low, p_high, color='blue', alpha=0.2, label='90% CI')
@@ -1396,7 +1304,7 @@ class DataForecaster:
             ax.set_xlim(0, len(sorted_))
             if not(resource == 'price'): ax.set_ylim(0, max(sorted_) * 1.3)
             ax.set_title(f'Month {month}')
-            txt = "Mean Price" if resource == 'price' else "Mean Capacity Factor"
+            txt = "Mean Price" if resource == 'price' else "Mean Production [MW]"
             ax.annotate(f'{txt}\nRealized: {mean_monthly:.2f}\nSim: {np.mean(sim_means):.2f}', xy=(0.25, 0.75), xycoords='axes fraction', bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", lw=1))
             ax.legend()
             ax.set_xlabel("Hours")
@@ -1404,23 +1312,21 @@ class DataForecaster:
         plt.savefig(f'documentation/{self.plot_dir}monthly_duration_curve_{resource}.png')
         plt.close()
 
-    def investigate_annual_duration_curves(self, simulations, year, resource='price'):
+    def investigate_annual_duration_curves(self, simulations, resource='price'):
         plt.figure(figsize=(10, 6))
         train_data = self.train_data[resource]
         simulated_data = [sim[resource] for sim in simulations]
-        year = simulated_data[0].index.year[0]
+
         if resource == 'price':
             ylabel="[€/MWh]"
-            cap = 1
         else:
-            cap = self.database.caps.loc[year, resource]
             ylabel="MW"
         
         # for ix, sim in enumerate(simulated_data):
         #     lbl = "" if ix > 0 else f"Simulations of year {year}" 
         #     plt.plot(np.sort(sim[resource]), color='blue', alpha=0.2, label=lbl)
         # Draw confidence intervals
-        mtx = np.asarray([np.sort(sim[resource].values).reshape(-1) for sim in simulated_data])
+        mtx = np.asarray([np.sort(sim.values).reshape(-1) for sim in simulated_data])
         p_low = np.percentile(mtx, 5, axis=0)
         p_high = np.percentile(mtx, 95, axis=0)
         plt.fill_between(range(len(p_low)), p_low, p_high, color='blue', alpha=0.2, label='90% CI')

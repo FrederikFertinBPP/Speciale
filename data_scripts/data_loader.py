@@ -11,10 +11,71 @@ import matplotlib.pyplot as plt
 
 # Token for ENTSO-E Transparency Platform: ea0b03ee-267d-4a52-b1c6-15ed7d94b79a
 
-class HistoricalData:
+class DataLoader:
+    time_columns = ['is_weekend', 'is_winter', 'is_summer', 'is_spring', 'is_autumn', 'is_day']
+    def __init__(self):
+        self.data = None
+        self.caps = None
+
+    def _add_sun_times_to_df(self, df, city_name="Lisbon", country="Portugal", timezone="UTC", latitude=38.71667, longitude=-9.13333):
+        """
+        Adds sunrise and sunset times to a DataFrame with a DatetimeIndex.
+
+        Parameters:
+        - df: pandas DataFrame with a DatetimeIndex
+        - city_name, country, timezone, latitude, longitude: location info
+
+        Returns:
+        - df: original DataFrame with 'sunrise' and 'sunset' columns added
+        """
+        location = LocationInfo(city_name, country, timezone, latitude, longitude)
+
+        # Create sunrise/sunset columns
+        sunrises = []
+        sunsets = []
+
+        for dt in df.index:
+            s = sun(location.observer, date=dt.date(), tzinfo=dt.tzinfo)
+            sunrises.append(s['sunrise'])
+            sunsets.append(s['sunset'])
+
+        df = df.assign(
+            sunrise = sunrises,
+            sunset = sunsets
+        )
+        return df
+
+    def _specify_time_data(self, df):
+        ix = df.index
+        df = self._add_sun_times_to_df(df) # Get sunrise and sundown of the day for every timestamp.
+        df = df.assign(
+            hour_of_day = ix.hour,
+            day_of_week = ix.day_of_week,
+            is_weekend = [day >= 5 for day in ix.day_of_week],
+            is_weekday = [day < 5 for day in ix.day_of_week],
+            is_day = [(row.name > pd.Timestamp(row['sunrise'])) and (row.name < pd.Timestamp(row['sunset'])) for _, row in df.iterrows()],
+            is_night = [(row.name <= pd.Timestamp(row['sunrise'])) or (row.name >= pd.Timestamp(row['sunset'])) for _, row in df.iterrows()],
+            is_winter = [date.month in [12, 1, 2] for date in ix],
+            is_spring = [date.month in [3, 4, 5] for date in ix],
+            is_summer = [date.month in [6, 7, 8] for date in ix],
+            is_autumn = [date.month in [9, 10, 11] for date in ix]
+        )
+        return df
+    
+    def _create_seasonal_features(self, df, prod_columns, drop_columns=None):
+        df = self._specify_time_data(df)
+        for p_col in prod_columns:
+                for t_col in self.time_columns:
+                    df.loc[df.index, str(p_col + '-' + t_col)] = df.loc[df.index, p_col].values * df.loc[df.index, t_col].values
+        if drop_columns is not None:
+            df = df.drop([drop_columns], axis=1)
+        return df
+    
+
+class HistoricalData(DataLoader):
     # Define API endpoint and parameters
     URL = "https://api.energidataservice.dk/dataset/"
-    ENTSOE_TOKEN = 'ea0b03ee-267d-4a52-b1c6-15ed7d94b79a'
+    ENTSOE_TOKEN = '39306393-0570-4890-8253-8f407431f951'
 
     def __init__(self,
                  start      :pd.Timestamp,
@@ -28,7 +89,6 @@ class HistoricalData:
         self.country = country_code
         self.start, self.end = start, end
         self.server, self.limit, self.priceArea = server, limit, priceArea
-        self.time_columns = ['is_weekend', 'is_winter', 'is_summer', 'is_spring', 'is_autumn', 'is_day']
         self.load_capacity_data()
         self.get_price_and_generation_data()
     
@@ -73,19 +133,23 @@ class HistoricalData:
         # years = [int(y.split(" ")[0]) for y in solar_caps.columns[1:]]
         # self.caps = pd.DataFrame(index=years,
         #                          data={'wind' : w_c.astype(float), 'solar' : s_c.astype(float)})
-        df = np.transpose(pd.read_excel('historical_data/eurostat_capacities.xlsx', sheet_name='Wind', skiprows=9, skipfooter=3))
-        df.columns = df.iloc[0]
-        df = df.iloc[1:,1:]
-        df = df.set_index(df.index.astype(int))
-        years = df.index
-        w_c = df['Portugal'].values.astype(float)
-        df = np.transpose(pd.read_excel('historical_data/eurostat_capacities.xlsx', sheet_name='Solar', skiprows=9, skipfooter=3))
-        df.columns = df.iloc[0]
-        df = df.iloc[1:,1:]
-        df = df.set_index(df.index.astype(int))
-        s_c = df['Portugal'].values.astype(float)
-        self.caps = pd.DataFrame(index=years,
-                                 data={'wind' : w_c.astype(float), 'solar' : s_c.astype(float)})
+        df = pd.read_csv('historical_data/wind_solar_capacity_PT.csv')
+        df.index = [pd.Period(df['Year'].iloc[q].astype(str) + '-' + df["Month"].iloc[q].astype(str)) for q in range(len(df))]
+        df.columns = ["Year", "Month", "wind", "solar"]
+        self.caps = df[['wind', 'solar']]
+        # df = np.transpose(pd.read_excel('historical_data/eurostat_capacities.xlsx', sheet_name='Wind', skiprows=9, skipfooter=3))
+        # df.columns = df.iloc[0]
+        # df = df.iloc[1:,1:]
+        # df = df.set_index(df.index.astype(int))
+        # years = df.index
+        # w_c = df['Portugal'].values.astype(float)
+        # df = np.transpose(pd.read_excel('historical_data/eurostat_capacities.xlsx', sheet_name='Solar', skiprows=9, skipfooter=3))
+        # df.columns = df.iloc[0]
+        # df = df.iloc[1:,1:]
+        # df = df.set_index(df.index.astype(int))
+        # s_c = df['Portugal'].values.astype(float)
+        # self.caps = pd.DataFrame(index=years,
+        #                          data={'wind' : w_c.astype(float), 'solar' : s_c.astype(float)})
 
     def get_data_from_entsoe(self):
         self.client = EntsoePandasClient(api_key=self.ENTSOE_TOKEN) # Object to query data through
@@ -122,60 +186,6 @@ class HistoricalData:
             row.index = [hour]
             df = pd.concat([df.loc[df.index < hour], row, df.loc[df.index > hour]])
         return df  
-    
-    def _specify_time_data(self, df):
-        ix = df.index
-        df = self._add_sun_times_to_df(df) # Get sunrise and sundown of the day for every timestamp.
-        df = df.assign(
-            hour_of_day = ix.hour,
-            day_of_week = ix.day_of_week,
-            is_weekend = [day >= 5 for day in ix.day_of_week],
-            is_weekday = [day < 5 for day in ix.day_of_week],
-            is_day = [(row.name > pd.Timestamp(row['sunrise'])) and (row.name < pd.Timestamp(row['sunset'])) for _, row in df.iterrows()],
-            is_night = [(row.name <= pd.Timestamp(row['sunrise'])) or (row.name >= pd.Timestamp(row['sunset'])) for _, row in df.iterrows()],
-            is_winter = [date.month in [12, 1, 2] for date in ix],
-            is_spring = [date.month in [3, 4, 5] for date in ix],
-            is_summer = [date.month in [6, 7, 8] for date in ix],
-            is_autumn = [date.month in [9, 10, 11] for date in ix]
-        )
-        return df
-
-    def _create_seasonal_features(self, df, prod_columns, drop_columns=None):
-        df = self._specify_time_data(df)
-        for p_col in prod_columns:
-                for t_col in self.time_columns:
-                    df.loc[df.index, str(p_col + '-' + t_col)] = df.loc[df.index, p_col].values * df.loc[df.index, t_col].values
-        if drop_columns is not None:
-            df = df.drop([drop_columns], axis=1)
-        return df
-
-    def _add_sun_times_to_df(self, df, city_name="Lisbon", country="Portugal", timezone="UTC", latitude=38.71667, longitude=-9.13333):
-        """
-        Adds sunrise and sunset times to a DataFrame with a DatetimeIndex.
-
-        Parameters:
-        - df: pandas DataFrame with a DatetimeIndex
-        - city_name, country, timezone, latitude, longitude: location info
-
-        Returns:
-        - df: original DataFrame with 'sunrise' and 'sunset' columns added
-        """
-        location = LocationInfo(city_name, country, timezone, latitude, longitude)
-
-        # Create sunrise/sunset columns
-        sunrises = []
-        sunsets = []
-
-        for dt in df.index:
-            s = sun(location.observer, date=dt.date(), tzinfo=dt.tzinfo)
-            sunrises.append(s['sunrise'])
-            sunsets.append(s['sunset'])
-
-        df = df.assign(
-            sunrise = sunrises,
-            sunset = sunsets
-        )
-        return df
 
     def _load_electricity_data(self):
         url = self.URL + "Elspotprices"
@@ -196,6 +206,7 @@ class HistoricalData:
         wind = self._fill_missing_hours(wind) # Fill in hours of missing data
         solar = self._fill_missing_hours(solar)
         return wind, solar
+
 
 def historical_price_inspection(data_object : HistoricalData):
     # Constants

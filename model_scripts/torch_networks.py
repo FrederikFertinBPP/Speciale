@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.autograd as autograd
+from gymnasium.spaces import flatten_space
 
 USE_CUDA = torch.cuda.is_available()
 # USE_CUDA = False # No, we use CPU.
@@ -76,24 +77,35 @@ class DQNNetwork:
 
 
 class TorchNetwork(nn.Module,DQNNetwork):
-    def __init__(self, env, trainable=True, learning_rate=0.001, hidden=30):
+    def __init__(self, env, trainable=True, learning_rate=0.001, hidden=30, writer=None):
         nn.Module.__init__(self)
         DQNNetwork.__init__(self)
+        # super().__init__(self)
         self.env = env
         self.num_hidden = hidden
         self.num_actions = np.prod(env.action_space.shape)
-        self.num_observations = np.prod(env.observation_space.shape)
+        self.observation_space = flatten_space(env.observation_space)
+        self.num_observations = np.prod(self.observation_space.shape)
+        self.num_features = self.num_observations
+        self.writer = writer
+        self.epoch = 0
+
+    def build_feature_network(self):
+        return (nn.Linear(self.num_features, self.num_hidden),
+                nn.ReLU(),)
+                # nn.Linear(self.num_hidden, self.num_hidden),
+                # nn.ReLU())
 
     def build_model_(self):
         raise NotImplementedError
 
-    def forward(self, s, a=None):
+    def forward(self, obs, a=None):
         raise NotImplementedError
 
-    def __call__(self, s, a=None):
-        return self.forward(s, a).detach().numpy()
+    def __call__(self, obs, a=None):
+        return self.forward(obs, a).detach().numpy()
 
-    def fit(self, target, s, a=None):
+    def fit(self, target, obs, a=None):
         raise NotImplementedError
 
     def update_Phi(self, source, tau=1):
@@ -115,67 +127,76 @@ class TorchNetwork(nn.Module,DQNNetwork):
 
     def load(self, path):
         self.load_state_dict(torch.load(path+".torchsave"))
-        self.eval() # set batch norm layers, dropout, other stuff we don't use
+        # self.eval() # set batch norm layers, dropout, other stuff we don't use
 
 
 class TorchActorNetwork(TorchNetwork):
-    def __init__(self, env, trainable=True, learning_rate=0.001, hidden=30):
-        super().__init__(env, trainable, learning_rate, hidden)
+    def __init__(self, env, trainable=True, learning_rate=0.001, hidden=30, writer=None):
+        super().__init__(env, trainable, learning_rate, hidden, writer)
         self.build_model_()
         if trainable:
             self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         if USE_CUDA:
             self.cuda()
 
-    def build_feature_network(self):
-        return (nn.Linear(self.num_observations, self.num_hidden),
-                nn.ReLU(),
-                nn.Linear(self.num_hidden, self.num_hidden),
-                nn.ReLU())
-
     def build_model_(self):
-        self.model = nn.Sequential(*self.build_feature_network(), nn.Linear(self.num_hidden,self.num_actions))
+        self.model = nn.Sequential(*self.build_feature_network(), nn.Linear(self.num_hidden,self.num_actions), nn.Hardtanh(0,1))
 
-    def forward(self, s, a=None):
-        return self.model(s) # Forward pass through the network to get action values
+    def forward(self, obs, a=None):
+        return self.model(obs) # Forward pass through the network to get action values
 
-    def fit(self, critic, s):
-        a = self.forward(s)
-        loss = -critic.forward(s, a).mean()  # Get the critic's evaluation of the actions
+    def fit(self, critic, obs):
+        a = self.forward(obs)
+        loss = -critic.forward(obs, a).mean()  # Get the critic's evaluation of the actions
+        if self.writer is not None:
+            self.writer.add_scalar("Actor (Train Loss)", loss, self.epoch)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+
+class TorchActorNetworkSteering(TorchActorNetwork):
+    def build_model_(self):
+        self.output_layer = nn.Linear(self.num_hidden, self.num_actions)
+        self.model = nn.Sequential(*self.build_feature_network(), self.output_layer)
+
+
+class TorchActorWarmstarter(TorchActorNetwork):
+    def fit(self, target_actions, obs):
+        a = self.forward(obs)
+        loss = (torch.FloatTensor(target_actions).detach() - a).pow(2).sum(axis=1).mean()  # Get the critic's evaluation of the actions
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
 
 class TorchCriticNetwork(TorchNetwork):
-    def __init__(self, env, trainable=True, learning_rate=0.001, hidden=30):
-        super().__init__(env, trainable, learning_rate, hidden)
-        self.num_features = self.num_observations + self.num_actions  # State + Action
+    def __init__(self, env, trainable=True, learning_rate=0.001, hidden=30, writer=None):
+        super().__init__(env, trainable, learning_rate, hidden, writer)
+        self.num_features = self.num_observations + self.num_actions # Observation + Action
+        self.criterion = nn.HuberLoss()
         self.build_model_()
         if trainable:
             self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         if USE_CUDA:
             self.cuda()
 
-    def __call__(self, s, a):
-        return self.forward(s, a).detach().numpy()
-
-    def build_feature_network(self):
-        return (nn.Linear(self.num_features, self.num_hidden),
-                nn.ReLU(),
-                nn.Linear(self.num_hidden, self.num_hidden),
-                nn.ReLU())
+    def __call__(self, obs, a):
+        return self.forward(obs, a).detach().numpy()
 
     def build_model_(self):
         self.model = nn.Sequential(*self.build_feature_network(), nn.Linear(self.num_hidden,1))
 
-    def forward(self, s, a):
-        features = torch.cat((s, a), dim=1)  # Concatenate state and action
+    def forward(self, obs, a):
+        features = torch.cat((obs, a), dim=1)  # Concatenate state and action
         return self.model(features)
     
-    def fit(self, target, s, a):
-        x = self.forward(s, a)
-        loss = (torch.FloatTensor(target).detach() - x).pow(2).sum(axis=1).mean()
+    def fit(self, target, obs, a):
+        x = self.forward(obs, a) # Current idea of the Q-value of our state and action
+        loss = self.criterion(x, target) # target contains the observed reward and the critic_target's and actor_target's evaluation of the Q-value of the next state.
+        # loss = (torch.FloatTensor(target).detach() - x).pow(2).sum(axis=1).mean() # MSE loss
+        if self.writer is not None:
+            self.writer.add_scalar("Critic (Train Loss)", loss, self.epoch)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()

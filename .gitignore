@@ -2,3 +2,8 @@ vthesisenv/
 __pycache__/
 *.pyc
 models/ts_models
+scenario_data/
+simulations/
+runs/
+experiments/
+historical_data/AFRY

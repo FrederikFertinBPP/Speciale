@@ -2,11 +2,14 @@ import os, glob, csv
 import pickle
 import numpy as np
 from collections import namedtuple
-import matplotlib.pyplot as plt
+from collections.abc import Iterable
 import pandas as pd
 
 fields = ('time', 'state', 'action', 'reward')
 Trajectory = namedtuple('Trajectory', fields + ("env_info",))
+
+class expando(object):
+    pass
 
 def cache_write(object, file_name, verbose=True):
     import lzma
@@ -87,39 +90,116 @@ def average_trajectories(trajectories):
     tavg = Trajectory(**dd, time=tlong.time, env_info=[])
     return tavg
 
-def experiment_load(experiment_name, exclude_empty=True):
-    files = list(filter(os.path.isdir, glob.glob(experiment_name + "/*")))
-    if exclude_empty:
-        files = [f for f in files if
-                 os.path.exists(os.path.join(f, "log.txt")) and os.stat(os.path.join(f, "log.txt")).st_size > 0]
-    if len(files) == 0:
-        return []
-    values = []
-    files = sorted(files, key=lambda file: os.path.basename(file))
-    for recent in files:
-        # recent = sorted(files, key=lambda file: os.path.basename(file))[-1]
-        stats = []
-        with open(recent + '/log.txt', 'r') as f:
-            csv_reader = csv.reader(f, delimiter='\t')
-            for i, row in enumerate(csv_reader):
-                if i == 0:
-                    head = row
-                else:
-                    def tofloat(v):
-                        try:
-                            return float(v)
-                        except Exception:
-                            return v
-
-                    stats.append({k: tofloat(v) for k, v in zip(head, row)})
-
-        tpath = recent + "/trajectories.pkl"
-        if cache_exists(tpath):
-            trajectories = cache_read(tpath)
+def _get_dir_path(experiment_name):
+    # Get latest of the experiments if there are multiple of the same name:
+    dir_path = ""
+    folder = os.getcwd() + "/experiments/"
+    experiments = os.listdir(folder)
+    t = -10**6 # Very large time compared to unix time from time.time()
+    for exp in experiments: # Load only the most recent experiment
+        file_list = tuple(exp.split('-'))
+        if len(file_list) == 5:
+            name, _, runtime, _, t_stamp = file_list
         else:
-            trajectories = None
-        values.append( (stats, trajectories, recent) )
-    return values
+            continue
+        if name == experiment_name:
+            if int(t_stamp) > t: # Just get the most recent experiment - should manually be changed if we want an older run.
+                t = int(t_stamp)
+                dir_path = folder + experiment_name + "-runtime-" + runtime + "-tstamp-" + t_stamp
+    return dir_path
+
+def load_trajectories(experiment_name, ):
+    dir_path = _get_dir_path(experiment_name)
+    if len(dir_path)>0:
+        return cache_read(dir_path + "/trajectories.pkl") # trajectories
+    else:
+        return []
+
+def load_stats(experiment_name, csv_version=False):
+    dir_path = _get_dir_path(experiment_name)
+    if len(dir_path)>0:
+        if csv_version:
+            return pd.read_csv(dir_path + "/agent_logbook.csv", index_col=0)
+        else:
+            return cache_read(dir_path + "/stats.pkl") # trajectories
+    else:
+        return []
+
+from collections.abc import Iterable
+
+class Flattener:
+    def __init__(self, sep=';', sep_iter='?'):
+        self.sep = sep
+        self.sep_iter = sep_iter
+
+    def _convert_lists_to_arrays(self, obj):
+        if isinstance(obj, dict):
+            return {k: self._convert_lists_to_arrays(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            # Recursively convert elements
+            converted = [self._convert_lists_to_arrays(el) for el in obj]
+
+            # Try converting to numpy array if elements are not dicts
+            if all(not isinstance(el, dict) for el in converted):
+                try:
+                    return np.array(converted)
+                except Exception:
+                    return converted
+            else:
+                return converted
+        else:
+            return obj
+
+    def flatten(self, d, parent_key=''):
+        items = []
+
+        def _flatten(obj, current_key):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    new_key = f"{current_key}{self.sep}{k}" if current_key else k
+                    _flatten(v, new_key)
+            elif isinstance(obj, Iterable) and not isinstance(obj, (str, bytes)):
+                for ix, v in enumerate(obj):
+                    new_key = f"{current_key}{self.sep_iter}{ix}" if current_key else str(ix)
+                    _flatten(v, new_key)
+            else:
+                items.append((current_key, obj))
+
+        _flatten(d, parent_key)
+        return dict(items)
+
+    def unflatten(self, flat_dict):
+        result = {}
+
+        for flat_key, value in flat_dict.items():
+            parts = flat_key.split(self.sep)
+            current = result
+
+            for i, part in enumerate(parts):
+                if self.sep_iter in part:
+                    key, idx = part.split(self.sep_iter)
+                    idx = int(idx)
+
+                    if key not in current:
+                        current[key] = []
+
+                    while len(current[key]) <= idx:
+                        current[key].append(None)
+
+                    if i == len(parts) - 1:
+                        current[key][idx] = value
+                    else:
+                        if current[key][idx] is None:
+                            current[key][idx] = {}
+                        current = current[key][idx]
+                else:
+                    if i == len(parts) - 1:
+                        current[part] = value
+                    else:
+                        current = current.setdefault(part, {})
+
+        return self._convert_lists_to_arrays(result)
+
 
 #%% Common functions
 def log_transform(y):
