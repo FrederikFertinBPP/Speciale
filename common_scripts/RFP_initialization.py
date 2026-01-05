@@ -265,14 +265,15 @@ def load_input_data():
     df_contracts = pd.read_excel(xls_path, sheet_name="Contracts")
     df_carriers = pd.read_excel(xls_path, sheet_name="Carriers")
     df_ppas = pd.read_excel(xls_path, sheet_name="PPAs")
-    return df_components, df_contracts, df_carriers, df_ppas
+    scenario_info = pd.read_excel(xls_path, sheet_name="Scenarios")
+    return df_components, df_contracts, df_carriers, df_ppas, scenario_info
 
-def create_rfp():
+def create_rfp(scenario_name:str = "default") -> RenewableFuelPlant:
     """
     Create a renewable fuel plant with defined components (i.e. fixed capacities and such) and contracts.
     """
     rfp = RenewableFuelPlant()
-    df_components, df_contracts, df_carriers, df_ppas = load_input_data()
+    df_components, df_contracts, df_carriers, df_ppas, scenario_info = load_input_data()
     
     for _, row in df_carriers.iterrows():
         rfp.add_carrier(Carrier(name=row["name"]))
@@ -291,6 +292,20 @@ def create_rfp():
                 cont.offtaker = row['name']
         rfp.add_component(PhysicalUnit(name=row["name"], parameters=parameters, offtake_contracts=offtake_contracts, notes=row.get("notes", "")))
     
+    # Apply scenario modifications
+    for _, row in scenario_info.iterrows():
+        if row.get("Scenario Name", "") == scenario_name:
+            _type = row.get("Changed Type") # contract, ppa, component
+            name = row.get("Changed Object")
+            parameter = row.get("Changed Parameter")
+            new_value = row.get("New Value")
+            if _type == "contract":
+               rfp.get_contract(name).parameters[parameter] = new_value
+            elif _type == "ppa":
+                rfp.get_ppa(name).parameters[parameter] = new_value
+            elif _type == "component":
+                rfp.get_component(name).parameters[parameter] = new_value
+
     return rfp
 
 # if __name__ == "__main__":

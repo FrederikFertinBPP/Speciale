@@ -13,8 +13,14 @@ from dateutil.relativedelta import relativedelta
 import os
 from model_scripts.hourly_models import ShieldLPModel, HourlyDeterministicLPModel, HourlyRecourseModel, ShieldRecourseModel
 
-def get_env(env_class:gym.Env, allow_spot_buy=True, balancing_market=False, verbose=False, load_data=False):
-    rfp = create_rfp()
+def get_env(env_class:gym.Env,
+            allow_spot_buy=True,
+            balancing_market=False,
+            verbose=False,
+            load_data=False,
+            scenario_name:str="default",
+            ):
+    rfp = create_rfp(scenario_name=scenario_name)
 
     forecaster = DataForecaster(from_pickle=True, cache_id="Anders")
     forecaster = forecaster.unpickle()
@@ -31,6 +37,15 @@ def get_env(env_class:gym.Env, allow_spot_buy=True, balancing_market=False, verb
     return env
 
 
+class EmissionFactorEstimator:
+    """  """
+    def __init__(self, model):
+        self.model = model
+    
+    def __call__(self, *args, **kwds):
+        return np.clip(self.model.predict(*args, **kwds), 0, np.inf)
+
+
 class VRESystemToAssetMapping:
     def __init__(self, model):
         self.model = model
@@ -41,6 +56,7 @@ class VRESystemToAssetMapping:
 
 class RFPShieldEnv(gym.Env):
     """ Environment, which allows for operating a Renewable Fuel Plant in a rolling horizon fashion. """
+    realization_memory_size = 24
     
     def __init__(self,
                  rfp:RenewableFuelPlant,
@@ -81,6 +97,10 @@ class RFPShieldEnv(gym.Env):
         self.solar_mapper = VRESystemToAssetMapping(solar_mapper)
         wind_mapper = cache_read(cache_path_mappers + "wind.pkl")
         self.wind_mapper = VRESystemToAssetMapping(wind_mapper)
+        # Calculates "Carbon intensity gCO₂eq/kWh (direct)" as a linear function of price [€/MWh], system wind [MW], and system solar [MW].
+        cache_path_mappers = os.getcwd() + "/models/plant_models/"
+        emissions_mapper = cache_read(cache_path_mappers + "emission_factor.pkl")
+        self.emissions_model = EmissionFactorEstimator(emissions_mapper)
 
         # The action space is defined as a Box with lower and upper bounds based on the capacities of the components
         self.action_identity = ['dayahead-ElectricitySpot-out_flow',
@@ -190,6 +210,7 @@ class RFPShieldEnv(gym.Env):
         self.ppa_context_space = gym.spaces.Box(low=0, high = np.asarray([c_high] * self.decision_horizon), dtype = np.float64)
         
         self.price_context_space = gym.spaces.Box(low=-500, high = np.asarray([4000] * self.decision_horizon), dtype = np.float64)
+        self.emissions_context_space = gym.spaces.Box(low=0, high = np.asarray([1] * self.decision_horizon), dtype = np.float64) # tCO2/MWh
 
         self.offtaker_names = []
         for name, offtaker in self.rfp.get_offtakers().items():
@@ -200,6 +221,7 @@ class RFPShieldEnv(gym.Env):
                                               "ppas": self.ppa_context_space,
                                               "offtakers": self.offtaker_context_space,
                                               "prices": self.price_context_space,
+                                              "emissions": self.emissions_context_space,
                                               })
 
     def _set_observation_space(self):
@@ -215,7 +237,6 @@ class RFPShieldEnv(gym.Env):
     def _set_time_context(self):
         """ How far are we in the frequency cycle? """
         T = pd.date_range(self.time, self.time+pd.Timedelta(self.decision_horizon-1, 'h'), freq='h')
-        self.realized_time += list(T)
 
         C = []
         for t in T:
@@ -241,17 +262,17 @@ class RFPShieldEnv(gym.Env):
             system_wind_realization = pd.read_csv(f"{self.scenario_path}wind_{timestamp_str}.csv")
         else:
             system_solar_realization, system_wind_realization = self.forecaster.realize_vre(start=self.time, end=self.time + pd.Timedelta(self.decision_horizon-1, 'h')) # DF
-        system_solar_realization, system_wind_realization = system_solar_realization['solar'].values, system_wind_realization['wind'].values
-        profiles = []
-        for name, ppa in self.rfp.get_ppas().items():
+        self.system_solar_realization, self.system_wind_realization = system_solar_realization['solar'].values, system_wind_realization['wind'].values
+
+        for ix, (name, ppa) in enumerate(self.rfp.get_ppas().items()):
             if ppa.parameters.get("consumes") == 'wind':
-                cf = self.wind_mapper(system_wind_realization)
+                cf = self.wind_mapper(self.system_wind_realization)
             elif ppa.parameters.get("consumes") == 'solar':
-                cf = self.solar_mapper(system_solar_realization)
+                cf = self.solar_mapper(self.system_solar_realization)
             else:
-                cf = np.ones(len(system_solar_realization)) # Assumes full availability of non-variable PPAs.
-            profiles.append(cf)
-        self.ppa_context = np.transpose(np.asarray(profiles))
+                cf = np.ones(len(self.system_solar_realization)) # Assumes full availability of non-variable PPAs.
+            self.realized_ppa[ix].extend(cf)
+        self.ppa_context = np.transpose(np.asarray(self.realized_ppa))
 
     def _set_offtaker_context(self):
         # Binary context space for offtaker availability:
@@ -279,13 +300,12 @@ class RFPShieldEnv(gym.Env):
         # Realize prices - updates the forecaster object by including the new realizations.
         if self.load_data:
             timestamp_str = self.time.strftime("%Y%m%d")
-            price_forecast = pd.read_csv(f"{self.scenario_path}forecast_{timestamp_str}_0.csv", usecols=["price"], nrows=24)['price'].values
+            price_forecast = pd.read_csv(f"{self.scenario_path}forecast_{timestamp_str}_0.csv", usecols=["price"], nrows=24)
             price_realization = pd.read_csv(f"{self.scenario_path}prices_{timestamp_str}.csv")
         else:
-            price_forecast = self.forecaster.forecast(start=self.time, end=self.time+pd.Timedelta(self.decision_horizon-1, 'h'), n_forecasts=1)[0]['price'].values
+            price_forecast = self.forecaster.forecast(start=self.time, end=self.time+pd.Timedelta(self.decision_horizon-1, 'h'), n_forecasts=1)[0]
             price_realization = self.forecaster.realize_prices(start=self.time, end=self.time+pd.Timedelta(self.decision_horizon-1, 'h'))
-        real_prices = price_realization['price'].values
-        self.realized_prices += list(real_prices)
+        self.realized_prices.extend(price_realization['price'].values)
         
         # Naive forecasts:
         # df_prices = pd.DataFrame(index=self.realized_time, data={"price": self.realized_prices})
@@ -300,13 +320,33 @@ class RFPShieldEnv(gym.Env):
         # df += [ma]
         # price_forecasts = np.asarray(df)
         # The price context then includes "price forecasts" - lag of 24, 48, 72, and weekly moving average.
-        self.price_context = price_forecast
+        self.price_context = price_forecast['price'].values
 
-    def _set_context(self):
-        self._set_time_context()
-        self._set_ppa_context()
-        self._set_offtaker_context()
-        self._set_price_context()
+    def _set_emissions_context(self):
+        # This where we map from simulated wind, solar, and prices or we draw from pregenerated scenario file.
+        hourly_index = pd.to_datetime(pd.date_range(self.time, self.time + pd.Timedelta(self.decision_horizon-1, 'hour'), freq='h'), utc=True)
+        year_month_index = hourly_index.tz_localize(None).to_period('M')
+        solar_capacities = year_month_index.map(self.forecaster.database.caps['solar'])
+        wind_capacities = year_month_index.map(self.forecaster.database.caps['wind'])
+        solar = self.system_solar_realization * solar_capacities
+        wind = self.system_wind_realization * wind_capacities
+        real_prices = np.asarray(list(self.realized_prices)[-self.decision_horizon:])
+        forecast_prices = self.price_context
+        X_forecast = pd.DataFrame(data={"price":forecast_prices, "wind":wind, "solar":solar})
+        X_real = pd.DataFrame(data={"price":real_prices, "wind":wind, "solar":solar})
+        forecast_emissions = self.emissions_model(X_forecast) / 1000 # Convert to unit tCO2/MWh.
+        real_emissions = self.emissions_model(X_real) / 1000 # Convert to unit tCO2/MWh.
+
+        self.realized_emissions.extend(real_emissions)
+        self.emissions_context = forecast_emissions
+
+    def _set_context(self, terminated=False):
+        if not(terminated):
+            self._set_time_context()
+            self._set_ppa_context()
+            self._set_offtaker_context()
+            self._set_price_context()
+            self._set_emissions_context()
 
     def _get_obs(self):
         """ Convert internal state to observation format.
@@ -314,7 +354,7 @@ class RFPShieldEnv(gym.Env):
             dict: Observation of state and context
         """
         self.state   = {"storages": self.storage_state, "contracts": self.contract_state}
-        self.context = {"time": self.time_context, "ppas": self.ppa_context, "offtakers": self.offtaker_context, "prices": self.price_context}
+        self.context = {"time": self.time_context, "ppas": self.ppa_context, "offtakers": self.offtaker_context, "prices": self.price_context, "emissions": self.emissions_context}
         return {"state": self.state, "context": self.context}
 
     def reset(self, *, seed: int | None = None, options = None):
@@ -329,9 +369,14 @@ class RFPShieldEnv(gym.Env):
         self.time = self.forecaster.t_init
         self.episode_end = self.forecaster.t_init + relativedelta(years=+1) - pd.Timedelta(1, 'hour') # Episodic implementation
         self.scenario_number += 1
+        if options is not None:
+            self.scenario_number = options.get("scenario_number", self.scenario_number)
+        
         self.scenario_path = f"scenario_data/{self.scenario_name}_scenario_{self.scenario_number}/"
-        self.realized_prices = []
-        self.realized_time = []
+
+        self.realized_prices    = deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size)
+        self.realized_ppa       = [deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size) for _ in range(self.observation_space["context"]["ppas"].shape[1])]
+        self.realized_emissions = deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size)
 
         # --- Reset state ---
         self.storage_state = self.storage_state_space.low
@@ -375,13 +420,22 @@ class RFPShieldEnv(gym.Env):
         self.shield.run(verbose=False)
         return self.shield.get_actions()
 
-    def _get_reward_and_info(self, prices, shield_penalty, truncated):
-        """ Calculate the reward based on the actions taken. """
-        spot_bought = self.shield.decision_results.spot_power # np.ndarray
-        spot_electricity_cost = np.sum(spot_bought * prices) # Float
-        contract_revenues = np.sum(list(self.shield.decision_results.delivered_revenue.values())) # Float
-        contract_penalties = np.sum(list(self.shield.decision_results.contract_penalty.values())) # Float
+    def _get_prices_and_emissions_for_step(self, horizon, terminated):
+        # Realize prices - already done when context is set.
+        prices = np.asarray(list(self.realized_prices)[-horizon:])
+        grid_emissions = np.asarray(list(self.realized_emissions)[-horizon:])
+        return prices, grid_emissions
 
+    def _get_reward_and_info(self, hourly_model, truncated, terminated, shield_penalty=0):
+        """ Calculate the reward based on the actions taken. """
+        res = hourly_model.decision_results
+        horizon = hourly_model.decision_horizon
+
+        prices, grid_emissions = self._get_prices_and_emissions_for_step(horizon, terminated)
+
+        contract_revenues = np.sum(list(res.delivered_revenue.values())) # Float
+        contract_penalties = np.sum(list(res.contract_penalty.values())) # Float
+        
         # Penalty for truncation violations equal to number of hours left in the year
         truncation_penalty = truncated * (self.episode_end-self.time).total_seconds()/3600 # Float
 
@@ -389,49 +443,56 @@ class RFPShieldEnv(gym.Env):
         info = {}
 
         # Electricity revenues
-        info["el_spot_buy"]             = np.sum(spot_bought * (spot_bought > 0)) # Float
-        info["el_spot_sell"]            = -np.sum(spot_bought * (spot_bought < 0)) # Float
-        info["el_spot_revenue"]         = -np.sum(spot_bought * prices * (spot_bought < 0)) # Float
-        info["el_spot_cost"]            = np.sum(spot_bought * prices * (spot_bought > 0)) # Float
-        info["el_spot_balance"]         = info["el_spot_revenue"] - info["el_spot_cost"] # Float
-        if self.balancing_market:
-            info["da_cost"]             = np.sum(self.shield.decision_results.dayahead_buy * prices)
-            info["ba_buy"]              = np.asarray(self.shield.decision_results.balancing_buy)
-            info["ba_sell"]             = np.asarray(self.shield.decision_results.balancing_sell)
+        info["net_market_import"] = res.spot_power # np.ndarray
 
-            info["ba_cost"]             = np.sum((np.asarray(self.shield.decision_results.balancing_buy) * 1.3 -
-                                                  np.asarray(self.shield.decision_results.balancing_sell) * 0.7) * prices)
-            info["el_revenue"]          = -(info["da_cost"] + info["ba_cost"])
-            spot_electricity_cost       = -info["el_revenue"]
+        info["dayahead_buy_profile"]   = res.da_buy * (res.da_buy > 0) # np.ndarray
+        info["dayahead_bought"]        = np.sum(info["dayahead_buy_profile"]) # Float
+        info["dayahead_sell_profile"]  = -res.da_buy * (res.da_buy < 0) # np.ndarray
+        info["dayahead_sold"]          = np.sum(info["dayahead_sell_profile"]) # Float
+        info["dayahead_cost"]          = np.sum(res.da_buy * prices) # Float
+        info["el_revenue"]             = -info["dayahead_cost"]
+        if self.balancing_market:
+            info["balancing_buy_profile"] = res.balancing_buy # np.ndarray
+            info["balancing_bought"] = np.sum(res.balancing_buy) # Float
+            info["balancing_buy_prices"] = np.asarray([prices[t] * (1.3 if prices[t] > 0 else 0.7) for t in range(horizon)]) # np.ndarray
+            info["balancing_sell_profile"] = res.balancing_sell # np.ndarray
+            info["balancing_sold"]   = np.sum(res.balancing_sell) # Float
+            info["balancing_sell_prices"] = np.asarray([prices[t] * (1.3 if prices[t] < 0 else 0.7) for t in range(horizon)]) # np.ndarray
+            info["balancing_buy_cost"]     = sum(res.balancing_buy[t] * info["balancing_buy_prices"][t] for t in range(horizon)) # Float
+            info["balancing_sell_revenue"] = sum(res.balancing_sell[t] * info["balancing_sell_prices"][t] for t in range(horizon)) # Float
+            
+            info["balancing_cost"] = info["balancing_buy_cost"] - info["balancing_sell_revenue"] # Float
+            info["el_revenue"] -= info["balancing_cost"] # Float
 
         # Fuel sale summaries
-        info["contract_revenues"]       = self.shield.decision_results.delivered_revenue # Dict
-        info["link_productions"]        = self.shield.decision_results.link_production # Dict
-        info["shipments"]               = self.shield.decision_results.shipments # Dict
+        info["contract_revenues"]       = res.delivered_revenue # Dict
+        info["link_productions"]        = res.link_production # Dict
+        info["shipments"]               = res.shipments # Dict
 
         # Penalties
-        info["contract_penalties"]      = self.shield.decision_results.contract_penalty # Dict
+        info["contract_penalties"]      = res.contract_penalty # Dict
         info["truncation_penalty"]      = truncation_penalty # Float
-        info["shield_penalty"]          = shield_penalty # Float
 
         # Electricity/power flows
-        info["ppa_power"]               = self.shield.decision_results.ppa_power # Dict
-        info["ppa_cost"]                = self.shield.decision_results.ppa_costs # Float
+        info["ppa_power"]               = res.ppa_power # Dict
+        info["ppa_cost"]                = res.ppa_costs # Float
         info["electricity_price"]       = prices # np.ndarray
+        info["electricity_emissions"]   = grid_emissions
+        info["power_consumption"]       = res.power_consumption
 
         # Hourly SOC
-        info["storage_soc"]             = self.shield.decision_results.storage_soc # Dict
-        info["contract_status"]         = self.shield.decision_results.contract_status # Dict
-
+        info["storage_soc"]             = res.storage_soc # Dict
+        info["contract_status"]         = res.contract_status # Dict
+        
         # Monetary summaries
-        info["real_cash_flow"]          = contract_revenues - spot_electricity_cost - contract_penalties # Float
+        info["real_cash_flow"]          = contract_revenues + info["el_revenue"] - contract_penalties - res.ppa_costs # Float
 
         # The reward can be custom-defined based on how we want to train the agent.
-        reward = contract_revenues - spot_electricity_cost - contract_penalties - shield_penalty - truncation_penalty # Float
+        reward = contract_revenues + info["el_revenue"] - contract_penalties - res.ppa_costs - truncation_penalty - shield_penalty # Float
 
         if truncated: # Inform about infeasibility causing truncation
             info["technical_violation_message"] = "Could not handle the flows determined by the agent."
-
+        
         return reward, info
 
     def _step(self, action):
@@ -451,18 +512,15 @@ class RFPShieldEnv(gym.Env):
         self.storage_state = np.asarray(list(self.shield.decision_results.final_soc.values()))
         self.contract_state = np.asarray(list(self.shield.decision_results.final_contract_status.values()))
 
-        # Realize prices - already done when context is set.
-        prices = np.asarray(self.realized_prices[-self.decision_horizon:])
-
-        reward, info = self._get_reward_and_info(prices, shield_penalty, truncated)
+        terminated = self.time + pd.Timedelta(self.decision_horizon, 'h') >= self.episode_end # Terminate episode after one year of operations
+        reward, info = self._get_reward_and_info(self.shield, truncated, terminated, shield_penalty)
         
         # We also save the current state in the info for possible flexible access.
         # --- Update context ---
         self.time += pd.Timedelta(self.decision_horizon, 'h')
-        terminated = self.time >= self.episode_end # Terminate episode after one year of operations
         info["time"] = self.time
-        # if not(terminated):
-        self._set_context()
+        
+        self._set_context(terminated=terminated)
 
         obs = self._get_obs()
         
@@ -496,6 +554,7 @@ class RFPYearEnv(RFPShieldEnv):
         t = self.original_forecaster.t_init
         t_end = self.original_forecaster.t_init + relativedelta(years=+1) # Episodic implementation
         horizon = (t_end - t).days * 24 # Number of hours in the year.
+        self.realization_memory_size = horizon
         super().__init__(rfp, forecaster, decision_horizon=horizon, allow_spot_buy=allow_spot_buy, normalize=normalize, verbose=verbose, load_data=load_data)
         self.pfm = HourlyDeterministicLPModel(rfp, decision_horizon=horizon, solver='gurobi', allow_spot_buy=allow_spot_buy)
         self.pfm.initialize_model()
@@ -508,19 +567,19 @@ class RFPYearEnv(RFPShieldEnv):
                 timestamp_str = (self.time+pd.Timedelta(day,'days')).strftime("%Y%m%d")
                 system_solar_realization += list(pd.read_csv(f"{self.scenario_path}solar_{timestamp_str}.csv")['solar'].values)
                 system_wind_realization += list(pd.read_csv(f"{self.scenario_path}wind_{timestamp_str}.csv")['wind'].values)
-            system_solar_realization = np.asarray(system_solar_realization)
-            system_wind_realization = np.asarray(system_wind_realization)
+            self.system_solar_realization = np.asarray(system_solar_realization)
+            self.system_wind_realization = np.asarray(system_wind_realization)
         else:
             system_solar_realization, system_wind_realization = self.forecaster.realize_vre(start=self.time, end=self.time + pd.Timedelta(self.decision_horizon-1, 'h')) # DF
-            system_solar_realization, system_wind_realization = system_solar_realization['solar'].values, system_wind_realization['wind'].values
+            self.system_solar_realization, self.system_wind_realization = system_solar_realization['solar'].values, system_wind_realization['wind'].values
         profiles = []
         for name, ppa in self.rfp.get_ppas().items():
             if ppa.parameters.get("consumes") == 'wind':
-                cf = self.wind_mapper(system_wind_realization)
+                cf = self.wind_mapper(self.system_wind_realization)
             elif ppa.parameters.get("consumes") == 'solar':
-                cf = self.solar_mapper(system_solar_realization)
+                cf = self.solar_mapper(self.system_solar_realization)
             else:
-                cf = np.ones(len(system_solar_realization)) # Assumes full availability of non-variable PPAs.
+                cf = np.ones(len(self.system_solar_realization)) # Assumes full availability of non-variable PPAs.
             profiles.append(cf)
         self.ppa_context = np.transpose(np.asarray(profiles))
 
@@ -536,26 +595,28 @@ class RFPYearEnv(RFPShieldEnv):
         else:
             price_forecast = self.forecaster.forecast(start=self.time, end=self.time+pd.Timedelta(self.decision_horizon-1, 'h'), n_forecasts=1)[0]['price'].values
             price_realization = list(self.forecaster.realize_prices(start=self.time, end=self.time+pd.Timedelta(self.decision_horizon-1, 'h'))['price'].values)
-        self.realized_prices += price_realization
+        self.realized_prices.extend(price_realization)
         self.price_context = price_forecast
 
-    def _get_reward_and_info(self, prices, shield_penalty, truncated):
-        reward, info = super()._get_reward_and_info(prices, shield_penalty, truncated)
+    def _get_reward_and_info(self, hourly_model, truncated, terminated, shield_penalty=0):
+        """ Calculate the reward based on the actions taken. """
+        reward, info = super()._get_reward_and_info(hourly_model, truncated, terminated, shield_penalty)
+
+        prices = info["electricity_price"]
 
         time_index = pd.to_datetime(pd.date_range(self.time, self.time+pd.Timedelta(self.decision_horizon-1, 'h'), freq='h'), utc=True)#prices.index
-        if self.load_data:
-            electricity_price = prices
-        else:
-            electricity_price = prices.values
-
-        wind_profile = info['ppa_power']['WindPower'] / self.rfp.get_ppa("WindPower").parameters.get("capacity")
-        solar_profile = info['ppa_power']['SolarPower'] / self.rfp.get_ppa("SolarPower").parameters.get("capacity")
         
-        wind_cf = {('WindPower', t): wind_profile[t] for t in range(self.decision_horizon)}
-        solar_cf = {('SolarPower', t): solar_profile[t] for t in range(self.decision_horizon)}
-        nuclear_cf = {('NuclearPower', t): 1.0 for t in range(self.decision_horizon)}
-        supplier_cf = {**wind_cf, **solar_cf, **nuclear_cf,}
-        electricity_price = {t: electricity_price[t] for t in range(self.decision_horizon)}
+        supplier_cf = {}
+        for ix, ppa_name in enumerate(self.ppa_names):
+            ppa = self.rfp.get_ppa(ppa_name)
+            ppa_profile = self.ppa_context[:,ix]
+            if ppa.parameters.get("consumes") == 'wind':
+                ppa_profile = self.wind_mapper(ppa_profile)
+            elif ppa.parameters.get("consumes") == 'solar':
+                ppa_profile = self.solar_mapper(ppa_profile)
+            supplier_cf = {**supplier_cf, **{(ppa_name, t): ppa_profile[t] for t in range(self.decision_horizon)}}
+
+        electricity_price = {t: prices[t] for t in range(self.decision_horizon)}
         datetime_data = {t: time_index[t] for t in range(self.decision_horizon)}
         data = {
             None: {
@@ -576,260 +637,6 @@ class RFPYearEnv(RFPShieldEnv):
 
 class RFPEnv(RFPShieldEnv):
     step_with_hourly_model = True
-    
-    def step(self, action, hourly_model):
-        """
-        Perform a step in the environment with the given normalized action.
-        Args:
-            action (np.array): The action in the range [0, 1].
-        Returns:
-            tuple: A tuple containing the next state, reward, terminated flag, truncated flag, and additional info.
-        """
-        if self.normalize_step:
-            return self._normalized_step(action)
-        else:
-            return self._step(action, hourly_model)
-
-    def _step(self, action, hourly_model):
-        """
-        Perform a step in the environment with the given action.
-        Args:
-            action np.array: The actions to take. shape:(decision_horizon, n_actions)
-        Returns:
-            tuple: A tuple containing the next state, reward, terminated flag, truncated flag, and additional info.
-        """
-        # Compute shielded actions and get correction penalty (0 if not needed).
-        
-        objective, truncated = hourly_model.get_objective()
-
-        # --- Update state ---
-        self.storage_state = np.asarray(list(hourly_model.decision_results.final_soc.values()))
-        self.contract_state = np.asarray(list(hourly_model.decision_results.final_contract_status.values()))
-
-        # Realize prices - already done when context is set.
-        prices = np.asarray(self.realized_prices[-self.decision_horizon:])
-
-        reward, info = self._get_reward_and_info(prices, hourly_model, truncated)
-        
-        # We also save the current state in the info for possible flexible access.
-        # --- Update context ---
-        self.time += pd.Timedelta(self.decision_horizon, 'h')
-        terminated = self.time >= self.episode_end # Terminate episode after one year of operations
-        info["time"] = self.time
-        # if not(terminated):
-        self._set_context()
-
-        obs = self._get_obs()
-
-        if truncated or terminated:
-            info["episode_runtime"] = get_unix_time() - self.episode_unix_start
-
-        return obs, reward, terminated, truncated, info
-
-    def _get_reward_and_info(self, prices, hourly_model, truncated):
-        """ Calculate the reward based on the actions taken. """
-        horizon = hourly_model.decision_horizon
-        spot_bought = hourly_model.decision_results.spot_power # np.ndarray
-        spot_electricity_cost = np.sum(spot_bought * prices) # Float
-        contract_revenues = np.sum(list(hourly_model.decision_results.delivered_revenue.values())) # Float
-        contract_penalties = np.sum(list(hourly_model.decision_results.contract_penalty.values())) # Float
-        
-        # Penalty for truncation violations equal to number of hours left in the year
-        truncation_penalty = truncated * (self.episode_end-self.time).total_seconds()/3600 # Float
-
-        """ Summarize environment state at the end of the step in the info dict. """
-        info = {}
-
-        # Electricity revenues
-        info["el_spot_bought"] = np.sum(spot_bought * (spot_bought > 0))
-        info["el_spot_sold"] = -np.sum(spot_bought * (spot_bought < 0))
-        info["el_spot_revenue"]             = -np.sum(spot_bought * prices * (spot_bought < 0)) # Float
-        info["el_spot_cost"]                = np.sum(spot_bought * prices * (spot_bought > 0)) # Float
-        info["el_spot_balance"]             = info["el_spot_revenue"] - info["el_spot_cost"] # Float
-        if self.balancing_market:
-            dayahead_buy = np.asarray(hourly_model.decision_results.dayahead_buy)
-            info["dayahead_bought"]        = np.sum(dayahead_buy * (dayahead_buy > 0))
-            info["dayahead_sold"]          = -np.sum(dayahead_buy * (dayahead_buy < 0))
-            info["dayahead_cost"]          = np.sum(dayahead_buy * prices)
-            info["balancing_power_bought"] = np.sum(hourly_model.decision_results.balancing_buy)
-            info["balancing_power_sold"]   = np.sum(hourly_model.decision_results.balancing_sell)
-            info["balancing_buy_cost"]     = sum(hourly_model.decision_results.balancing_buy[t] * prices[t] * (1.3 if prices[t] > 0 else 0.7) for t in range(horizon))
-            info["balancing_sell_revenue"] = sum(hourly_model.decision_results.balancing_sell[t] * prices[t] * (1.3 if prices[t] < 0 else 0.7) for t in range(horizon))
-            info["balancing_cost"]         = info["balancing_buy_cost"] - info["balancing_sell_revenue"]
-            info["el_revenue"]          = -(info["dayahead_cost"] + info["balancing_cost"])
-            spot_electricity_cost       = -info["el_revenue"]
-
-        # Fuel sale summaries
-        info["contract_revenues"]           = hourly_model.decision_results.delivered_revenue # Dict
-        info["link_productions"]            = hourly_model.decision_results.link_production # Dict
-        info["shipments"]                   = hourly_model.decision_results.shipments # Dict
-
-        # Penalties
-        info["contract_penalties"]          = hourly_model.decision_results.contract_penalty # Dict
-        info["truncation_penalty"]          = truncation_penalty # Float
-
-        # Electricity/power flows
-        info["ppa_power"]                   = hourly_model.decision_results.ppa_power # Dict
-        info["ppa_cost"]                    = hourly_model.decision_results.ppa_costs # Float
-        info["electricity_price"]           = prices # np.ndarray
-
-        # Hourly SOC
-        info["storage_soc"]                 = hourly_model.decision_results.storage_soc # Dict
-        info["contract_status"]             = hourly_model.decision_results.contract_status # Dict
-        
-        # Monetary summaries
-        info["real_cash_flow"]              = contract_revenues - spot_electricity_cost - contract_penalties # Float
-
-        # The reward can be custom-defined based on how we want to train the agent.
-        reward = contract_revenues - spot_electricity_cost - contract_penalties - truncation_penalty # Float
-
-        if truncated: # Inform about infeasibility causing truncation
-            info["technical_violation_message"] = "Could not handle the flows determined by the agent."
-        
-        return reward, info
-
-
-class RFPRecourseEnv(RFPEnv):
-    
-    def _set_context_space(self):
-        """ Define the context of the observation space. """
-        # --- Time information ---
-        self.time_context_space = gym.spaces.Box(low=0, high=1, shape=(self.decision_horizon+12, len(self.rfp.frequency_options)))
-
-        # --- Power-Purchase-Agreements ---
-        self.ppa_names, c_high = [], []
-        for name, ppa in self.rfp.get_ppas().items():
-            self.ppa_names.append(name)
-            c_high.append(ppa.parameters.get("capacity"))
-            self.metadata = {**self.metadata, **{str(name.replace(" ", "_").lower() + "_capacity"): c_high[-1]}}
-        self.ppa_context_space = gym.spaces.Box(low=0, high = np.asarray([c_high] * (12+self.decision_horizon)), dtype = np.float64)
-        
-        # The price context contains forecast prices
-        self.price_context_space = gym.spaces.Box(low=-500, high = np.asarray([4000] * (self.decision_horizon)), dtype = np.float64)
-
-        self.offtaker_names = []
-        for name, offtaker in self.rfp.get_offtakers().items():
-            self.offtaker_names.append(name)
-        self.offtaker_context_space = gym.spaces.MultiBinary(n=(self.decision_horizon*14, len(self.offtaker_names)))
-
-        self.context_space = gym.spaces.Dict({"time": self.time_context_space,
-                                              "ppas": self.ppa_context_space,
-                                              "offtakers": self.offtaker_context_space,
-                                              "prices": self.price_context_space,
-                                              })
-
-    def _set_context(self, reset=False):
-        self._set_time_context()
-        self._set_ppa_context()
-        self._set_offtaker_context()
-        self._set_price_context()
-
-    def _set_time_context(self):
-        """ How far are we in the frequency cycle? """
-        T = pd.date_range(self.time-pd.Timedelta(12, 'h'), self.time+pd.Timedelta(self.decision_horizon-1, 'h'), freq='h')
-
-        C = []
-        for t in T:
-            c = []
-            for freq in self.rfp.frequency_options:
-                if freq=='hourly':
-                    c.append(t.minute/60) # If we want to go to sub-hourly operations.
-                if freq=='daily':
-                    c.append(t.hour/24)
-                if freq=='monthly':
-                    c.append(t.day/t.days_in_month)
-                if freq=='yearly':
-                    days_in_year = 366 if t.is_leap_year else 365
-                    c.append(t.day_of_year/days_in_year)
-            C.append(c)
-        self.time_context = np.asarray(C)
-
-    def _set_ppa_context(self):
-        # Realize VRE PPA availability for the next decision horizon (typically 24 hours)
-        if self.load_data:
-            timestamp_str = self.time.strftime("%Y%m%d")
-            system_solar_realization = pd.read_csv(f"{self.scenario_path}solar_{timestamp_str}.csv")
-            system_wind_realization = pd.read_csv(f"{self.scenario_path}wind_{timestamp_str}.csv")
-        else:
-            system_solar_realization, system_wind_realization = self.forecaster.realize_vre(start=self.time, end=self.time + pd.Timedelta(self.decision_horizon-1, 'h')) # DF
-        system_solar_realization, system_wind_realization = system_solar_realization['solar'].values, system_wind_realization['wind'].values
-
-        for ix, (name, ppa) in enumerate(self.rfp.get_ppas().items()):
-            if ppa.parameters.get("consumes") == 'wind':
-                cf = self.wind_mapper(system_wind_realization)
-            elif ppa.parameters.get("consumes") == 'solar':
-                cf = self.solar_mapper(system_solar_realization)
-            else:
-                cf = np.ones(len(system_solar_realization)) # Assumes full availability of non-variable PPAs.
-            self.realized_ppa[ix].extend(cf)
-        self.ppa_context = np.transpose(np.asarray(self.realized_ppa))
-
-    def _set_offtaker_context(self):
-        # Binary context space for offtaker availability:
-        availabilities = []
-        offtaker_schedule_horizon = self.decision_horizon*14
-        time_stamps = pd.to_datetime(pd.date_range(start=self.time, end=self.time+pd.Timedelta(offtaker_schedule_horizon-1, 'h'), freq='h'), utc=True)
-        for name, offtaker in self.rfp.get_offtakers().items():
-            availability_frequency = offtaker.parameters.get("availability")
-            a = np.zeros(offtaker_schedule_horizon)
-            for t in range(offtaker_schedule_horizon):
-                time = time_stamps[t]
-                if availability_frequency=='hourly':
-                    a[t] = 1
-                if availability_frequency=='daily':
-                    a[t] = int(time.hour == 23)
-                if availability_frequency=='monthly':
-                    a[t] = int(time.is_month_end and time.hour == 23)
-                if availability_frequency=='yearly':
-                    a[t] = int(time.is_year_end and time.hour == 23)
-            availabilities.append(a)
-        
-        self.offtaker_context = np.transpose(np.asarray(availabilities))
-
-    def _set_price_context(self):
-        # Realize prices - updates the forecaster object by including the new realizations.
-        if self.load_data:
-            timestamp_str = self.time.strftime("%Y%m%d")
-            price_forecast = pd.read_csv(f"{self.scenario_path}forecast_{timestamp_str}_0.csv", usecols=["price"], nrows=24)['price'].values
-            price_realization = pd.read_csv(f"{self.scenario_path}prices_{timestamp_str}.csv")
-        else:
-            price_forecast = self.forecaster.forecast(start=self.time, end=self.time+pd.Timedelta(self.decision_horizon-1, 'h'), n_forecasts=1)[0]['price'].values
-            price_realization = self.forecaster.realize_prices(start=self.time, end=self.time+pd.Timedelta(self.decision_horizon-1, 'h'))
-        real_prices = price_realization['price'].values
-        self.realized_prices.extend(real_prices)
-        self.forecast_prices.extend(price_forecast)
-        self.price_context = price_forecast
-
-    def reset(self, *, seed: int | None = None, options = None):
-        """
-        Reset the environment to its initial state.
-        Returns:
-            tuple: The initial state of the environment, and additional info.
-        """
-        # Reset core and stochastic components of environment:
-        gym.Env.reset(self, seed=seed)
-        self.forecaster = copy.deepcopy(self.original_forecaster) # self.forecaster.set_seed(np.random.randint(low=0,high=2**30))
-        self.time = self.forecaster.t_init
-        self.episode_end = self.forecaster.t_init + relativedelta(years=+1) - pd.Timedelta(1, 'hour') # Episodic implementation
-        self.scenario_number += 1
-        self.scenario_path = f"scenario_data/{self.scenario_name}_scenario_{self.scenario_number}/"
-        
-        self.realized_prices = deque(np.zeros(36),maxlen=36)
-        self.realized_ppa = [deque(np.zeros(36),maxlen=36) for _ in range(self.observation_space["context"]["ppas"].shape[1])]
-        self.forecast_prices = deque(np.zeros(12+4*24),maxlen=108)
-
-        # --- Reset state ---
-        self.storage_state = self.storage_state_space.low
-        self.contract_state = self.contract_state_space.low
-
-        # --- Reset context ---
-        self._set_context()
-
-        obs = self._get_obs()
-        info = {"time": self.time,}
-        self.episode_unix_start = get_unix_time()
-
-        return obs, info
 
     def _step(self, action, hourly_model):
         """
@@ -854,9 +661,8 @@ class RFPRecourseEnv(RFPEnv):
         # --- Update context ---
         self.time += pd.Timedelta(self.decision_horizon, 'h')
         info["time"] = self.time
-        info["terminates_next"] = self.time + pd.Timedelta(self.decision_horizon, 'h') >= self.episode_end
-        
-        self._set_context()
+
+        self._set_context(terminated=terminated)
 
         obs = self._get_obs()
 
@@ -865,65 +671,92 @@ class RFPRecourseEnv(RFPEnv):
 
         return obs, reward, terminated, truncated, info
 
-    def _get_reward_and_info(self, hourly_model, truncated, terminated):
-        """ Calculate the reward based on the actions taken. """
-        horizon = hourly_model.decision_horizon
-        if terminated: # If we terminate then we roll 36 hours instead of 24
-            prices = np.asarray(list(self.realized_prices))
+    def _normalized_step(self, normalized_action, hourly_model):
+        # Denormalize the action to the original action space
+        action = self.action_scaler.inverse_transform(normalized_action)
+        return self._step(action, hourly_model)
+
+    def step(self, action, hourly_model):
+        """
+        Perform a step in the environment with the given normalized action.
+        Args:
+            action (np.array): The action in the range [0, 1].
+        Returns:
+            tuple: A tuple containing the next state, reward, terminated flag, truncated flag, and additional info.
+        """
+        if self.normalize_step:
+            return self._normalized_step(action, hourly_model)
         else:
-            prices = np.asarray(list(self.realized_prices)[24-horizon:24]) # For the first day we only lock 12 hours of decisions.
+            return self._step(action, hourly_model)
 
-        contract_revenues = np.sum(list(hourly_model.decision_results.delivered_revenue.values())) # Float
-        contract_penalties = np.sum(list(hourly_model.decision_results.contract_penalty.values())) # Float
+
+class RFPRecourseEnv(RFPEnv):
+    balancing_market = True
+    realization_memory_size = 36
+    
+    def _set_context_space(self):
+        """ Define the context of the observation space. """
+        # --- Time information ---
+        self.time_context_space = gym.spaces.Box(low=0, high=1, shape=(self.decision_horizon+12, len(self.rfp.frequency_options)))
+
+        # --- Power-Purchase-Agreements ---
+        self.ppa_names, c_high = [], []
+        for name, ppa in self.rfp.get_ppas().items():
+            self.ppa_names.append(name)
+            c_high.append(ppa.parameters.get("capacity"))
+            self.metadata = {**self.metadata, **{str(name.replace(" ", "_").lower() + "_capacity"): c_high[-1]}}
+        self.ppa_context_space = gym.spaces.Box(low=0, high = np.asarray([c_high] * (12+self.decision_horizon)), dtype = np.float64)
         
-        # Penalty for truncation violations equal to number of hours left in the year
-        truncation_penalty = truncated * (self.episode_end-self.time).total_seconds()/3600 # Float
+        # The price context contains forecast prices
+        self.price_context_space = gym.spaces.Box(low=-500, high = np.asarray([4000] * (self.decision_horizon)), dtype = np.float64)
+        self.emissions_context_space = gym.spaces.Box(low=0, high = np.asarray([1] * self.decision_horizon), dtype = np.float64) # tCO2/MWh
 
-        """ Summarize environment state at the end of the step in the info dict. """
-        info = {}
+        self.offtaker_names = []
+        for name, offtaker in self.rfp.get_offtakers().items():
+            self.offtaker_names.append(name)
+        self.offtaker_context_space = gym.spaces.MultiBinary(n=(self.decision_horizon*14, len(self.offtaker_names)))
 
-        info["net_market_import"]   = hourly_model.decision_results.spot_power
-        # Electricity revenues
-        dayahead_buy = np.asarray(hourly_model.decision_results.dayahead_buy)
-        info["dayahead_bought"]        = np.sum(dayahead_buy * (dayahead_buy > 0))
-        info["dayahead_sold"]          = -np.sum(dayahead_buy * (dayahead_buy < 0))
-        info["dayahead_cost"]          = np.sum(dayahead_buy * prices)
-        
-        info["balancing_power_bought"] = np.sum(hourly_model.decision_results.balancing_buy)
-        info["balancing_power_sold"]   = np.sum(hourly_model.decision_results.balancing_sell)
-        info["balancing_buy_cost"]     = sum(hourly_model.decision_results.balancing_buy[t] * prices[t] * (1.3 if prices[t] > 0 else 0.7) for t in range(horizon))
-        info["balancing_sell_revenue"] = sum(hourly_model.decision_results.balancing_sell[t] * prices[t] * (1.3 if prices[t] < 0 else 0.7) for t in range(horizon))
-        info["balancing_cost"]         = info["balancing_buy_cost"] - info["balancing_sell_revenue"]
-        info["el_revenue"]             = -(info["dayahead_cost"] + info["balancing_cost"])
-        spot_electricity_cost = -info["el_revenue"]
+        self.context_space = gym.spaces.Dict({"time": self.time_context_space,
+                                              "ppas": self.ppa_context_space,
+                                              "offtakers": self.offtaker_context_space,
+                                              "prices": self.price_context_space,
+                                              "emissions": self.emissions_context_space,
+                                              })
 
-        # Fuel sale summaries
-        info["contract_revenues"]           = hourly_model.decision_results.delivered_revenue # Dict
-        info["link_productions"]            = hourly_model.decision_results.link_production # Dict
-        info["shipments"]                   = hourly_model.decision_results.shipments # Dict
+    def _set_time_context(self):
+        """ How far are we in the frequency cycle? """
+        T = pd.date_range(self.time-pd.Timedelta(12, 'h'), self.time+pd.Timedelta(self.decision_horizon-1, 'h'), freq='h')
 
-        # Penalties
-        info["contract_penalties"]          = hourly_model.decision_results.contract_penalty # Dict
-        info["truncation_penalty"]          = truncation_penalty # Float
+        C = []
+        for t in T:
+            c = []
+            for freq in self.rfp.frequency_options:
+                if freq=='hourly':
+                    c.append(t.minute/60) # If we want to go to sub-hourly operations.
+                if freq=='daily':
+                    c.append(t.hour/24)
+                if freq=='monthly':
+                    c.append(t.day/t.days_in_month)
+                if freq=='yearly':
+                    days_in_year = 366 if t.is_leap_year else 365
+                    c.append(t.day_of_year/days_in_year)
+            C.append(c)
+        self.time_context = np.asarray(C)
 
-        # Electricity/power flows
-        info["ppa_power"]                   = hourly_model.decision_results.ppa_power # Dict
-        info["ppa_cost"]                    = hourly_model.decision_results.ppa_costs # Float
-        info["electricity_price"]           = prices # np.ndarray
+    def _get_prices_and_emissions_for_step(self, horizon, terminated):
+        if terminated:
+            # If we terminate then we roll 36 hours instead of 24
+            prices = np.asarray(list(self.realized_prices))
+            grid_emissions = np.asarray(list(self.realized_emissions))
+        else:
+            # For the first day we only lock 12 hours of decisions.
+            prices = np.asarray(list(self.realized_prices)[24-horizon:24])
+            grid_emissions = np.asarray(list(self.realized_emissions)[24-horizon:24])
+        return prices, grid_emissions
 
-        # Hourly SOC
-        info["storage_soc"]                 = hourly_model.decision_results.storage_soc # Dict
-        info["contract_status"]             = hourly_model.decision_results.contract_status # Dict
-        
-        # Monetary summaries
-        info["real_cash_flow"]              = contract_revenues - spot_electricity_cost - contract_penalties # Float
-
-        # The reward can be custom-defined based on how we want to train the agent.
-        reward = contract_revenues - spot_electricity_cost - contract_penalties - truncation_penalty # Float
-
-        if truncated: # Inform about infeasibility causing truncation
-            info["technical_violation_message"] = "Could not handle the flows determined by the agent."
-        
-        return reward, info
+    def _step(self, action, hourly_model):
+        obs, reward, terminated, truncated, info = super()._step(action, hourly_model)
+        info["terminates_next"] = self.time + pd.Timedelta(self.decision_horizon, 'h') >= self.episode_end
+        return obs, reward, terminated, truncated, info
 
 

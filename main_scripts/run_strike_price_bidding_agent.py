@@ -35,8 +35,7 @@ def main():
 
     experiment_name = "_".join(["test", str(agent), guideline, "ph", str(planning_horizon), "spot", str(allow_spot_buy)])
     print("Start experiment: ", experiment_name)
-    stats, trajectories = train(env, agent, experiment_name=experiment_name,
-                                num_episodes=n_episodes, verbose=True, save_every=10)
+    stats, trajectories = train(env, agent, experiment_name=experiment_name, num_episodes=n_episodes, verbose=True)
     agent.close()
     print("Experiment done")
 

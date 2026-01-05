@@ -228,33 +228,31 @@ def make_trajectory_figures(env, trajectory, stat, experiment_name, trajectory_i
 
 if __name__ == '__main__':
     """ Change the experiment name to the one we want to visualize: """
-    experiment_name = "testDecisionRuleAgent"
-    # experiment_name = "testNewEnvStochasticproduction_value"
-    # experiment_name = "testNewEnvproduction_value"
-    # experiment_name = "testDomainsDecisionRuleAgent"
-    # experiment_name = "testPreloadedproduction_value"
-    experiment_name ="test_RecourseAgent1_production_value_ph_96_spot_True"
-    # experiment_name ="test_RecourseAgent5_production_value_ph_96_spot_True"
-    # experiment_name = "testDomainsDecisionRuleAgent"
-    # experiment_name = "test_DeterministicHA_hourly_target_ph_96_spot_True"
-    # experiment_name = "test_DeterministicHA_production_value_ph_96_spot_True"
-    # experiment_name = "test_StochasticHA5_production_value_ph_96_spot_True"
-
-    """ Plotting the first trajectory of the experiment """
-    print(experiment_name)
+    experiment_names = ("test_BiddingCurveAgent1_D1_ph_96_spot_True",
+                        "test_BiddingCurveAgent1_D2_ph_96_spot_True",
+                        "test_BiddingCurveAgent1_D3_ph_96_spot_True",
+                        "test_DeterministicHA_hourly_target_ph_96_spot_True",
+                        "test_DeterministicHA_production_value_ph_96_spot_True",
+                        "test_StochasticHA5_production_value_ph_96_spot_True",
+                        "test_RecourseAgent1_production_value_ph_96_spot_True",
+                        "test_RecourseAgent5_production_value_ph_96_spot_True",
+                        "test_StrikePriceBiddingAgent1_SP1_production_value_ph_96_spot_True"
+                        )
     planning_horizon = 4 * 24
     decision_horizon = 24
     env = RFPShieldEnv(rfp=rfp, decision_horizon=decision_horizon, planning_horizon=planning_horizon)
+    for experiment_name in experiment_names:
+        """ Plotting the first trajectory of the experiment """
+        print(experiment_name)
+        trajectories = load_trajectories(experiment_name)
+        stats = load_stats(experiment_name, csv_version=False)
+        # experiment_name += "_new"
 
-    trajectories = load_trajectories(experiment_name)
-    stats = load_stats(experiment_name, csv_version=False)
-    # experiment_name += "_new"
+        dn = os.path.dirname("trajectory_plots/" + experiment_name + "/")
+        if not os.path.exists(dn):
+            os.mkdir(dn)
 
-    dn = os.path.dirname("trajectory_plots/" + experiment_name + "/")
-    if not os.path.exists(dn):
-        os.mkdir(dn)
-
-    #%% Trajectory summary:
-    print("Experiment: ", experiment_name)
-    for ix in range(min(10,len(trajectories))):
-        make_trajectory_figures(env, trajectory=trajectories[ix], stat = stats[ix], experiment_name=experiment_name, trajectory_index=ix)
+        #%% Trajectory summary:
+        print("Experiment: ", experiment_name)
+        for ix in range(min(10,len(trajectories))):
+            make_trajectory_figures(env, trajectory=trajectories[ix], stat = stats[ix], experiment_name=experiment_name, trajectory_index=ix)

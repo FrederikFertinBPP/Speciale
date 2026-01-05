@@ -32,6 +32,7 @@ class HourlyDeterministicLPModel:
                  allow_spot_buy: bool = True,
                  guideline: str|None = None,
                  objective_logic: str|None = None,
+                 documentation: bool = False,
                  **kwargs,
                  ):
         
@@ -41,6 +42,7 @@ class HourlyDeterministicLPModel:
         self.planning_horizon = max(planning_horizon, self.decision_horizon)
         self.allow_spot_buy   = allow_spot_buy
         self.objective_logic  = objective_logic
+        self.documentation    = documentation # If true, the model will store extra information useful for documentation of results.
 
         assert guideline in self.guideline_options, "f{guideline} not in guideline options: {self.guideline_options}"
         self.guideline = guideline
@@ -196,7 +198,6 @@ class HourlyDeterministicLPModel:
             contract        = self.rfp.get_contract(cont)
             b._name         = cont
             b.carrier_in    = contract.parameters.get("resource")
-            b.volume        = contract.parameters.get("volume")
             b.price         = contract.parameters.get("price")
             b.penalty       = contract.parameters.get("penalty")
             b.offtaker      = contract.offtaker
@@ -205,13 +206,29 @@ class HourlyDeterministicLPModel:
             b.target_frequency      = contract.parameters.get("target_frequency", None)
             b.shipment_frequency    = contract.parameters.get("shipment_frequency", None)
 
-            """ Physical flow of product to contract: """ 
-            b.shipment = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, min(b.volume, b.offtaker_capacity)))
-            if b.is_spot_contract == False:
-                # Bookkeeping of contract status and whether obligations are met.
-                b.contract_status = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.volume))
-                b.contract_shortfall = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.volume))
-                b.contract_slack = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.volume)) # Slack variable. Excess shipments are not awarded.
+            if not(self.documentation):
+                b.volume        = contract.parameters.get("volume")
+                """ Physical flow of product to contract: """ 
+                b.shipment = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, min(b.volume, b.offtaker_capacity)))
+                if b.is_spot_contract == False:
+                    # Bookkeeping of contract status and whether obligations are met.
+                    b.contract_status = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.volume))
+                    b.contract_shortfall = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.volume))
+                    b.contract_slack = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.volume)) # Slack variable. Excess shipments are not awarded.
+            else:
+                b.volume = pyo.Var(domain=pyo.Reals)
+                b.volume_constraint = pyo.Constraint(expr= b.volume == contract.parameters.get("volume"))
+                """ Physical flow of product to contract: """ 
+                b.shipment = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.offtaker_capacity))
+                b.shipment_volume_constraint = pyo.Constraint(self.model.T, rule=lambda m, t: b.shipment[t] <= b.volume)
+                if b.is_spot_contract == False:
+                    # Bookkeeping of contract status and whether obligations are met.
+                    b.contract_status = pyo.Var(self.model.T, domain=pyo.NonNegativeReals)
+                    b.contract_shortfall = pyo.Var(self.model.T, domain=pyo.NonNegativeReals)
+                    b.contract_slack = pyo.Var(self.model.T, domain=pyo.NonNegativeReals) # Slack variable. Excess shipments are not awarded.
+                    b.contract_status_bounds = pyo.Constraint(self.model.T, rule=lambda m, t: b.contract_status[t] <= b.volume)
+                    b.contract_shortfall_bounds = pyo.Constraint(self.model.T, rule=lambda m, t: b.contract_shortfall[t] <= b.volume)
+                    b.contract_slack_bounds = pyo.Constraint(self.model.T, rule=lambda m, t: b.contract_slack[t] <= b.volume)
         self.model.contractBlocks = pyo.Block(self.model.contracts, rule=contractBlock_rule)
 
     def _build_concrete_instance(self, data=None):
@@ -453,12 +470,14 @@ class HourlyDeterministicLPModel:
 
             # Save flow and soc results as well for plotting purposes:
             res_object.spot_power      = np.asarray([pyo.value(self.inst.dayaheadBlocks['ElectricitySpot'].out_flow[t]) for t in t_slice])
+            res_object.da_buy          = np.asarray([pyo.value(self.inst.dayaheadBlocks['ElectricitySpot'].out_flow[t]) for t in t_slice])
             res_object.ppa_power       = {name : np.asarray([pyo.value(self.inst.ppaBlocks[name].out_flow[t]) for t in t_slice]) for name in self.inst.ppas}
             res_object.ppa_costs       = sum(pyo.value(b.out_flow[t]) * pyo.value(b.price) for _, b in self.inst.ppaBlocks.items() for t in t_slice)
             res_object.storage_soc     = {name : np.asarray([pyo.value(self.inst.storageBlocks[name].soc[t]) for t in t_slice]) for name in self.inst.storages}
             res_object.storage_inflow  = {name : np.asarray([pyo.value(self.inst.storageBlocks[name].in_flow[t]) for t in t_slice]) for name in self.inst.storages}
             res_object.storage_outflow = {name : np.asarray([pyo.value(self.inst.storageBlocks[name].out_flow[t]) for t in t_slice]) for name in self.inst.storages}
             res_object.link_production = {name : np.asarray([pyo.value(self.inst.linkBlocks[name].out_flow[t]) for t in t_slice]) for name in self.inst.links}
+            res_object.power_consumption = np.asarray([pyo.value(self.inst.linkBlocks['Grid Connection Point'].in_flow[t]) for t in t_slice])
 
             # Contractually related results:
             res_object.shipments          = {cont : np.asarray([pyo.value(self.inst.contractBlocks[cont].shipment[t]) for t in t_slice])
@@ -480,11 +499,15 @@ class HourlyDeterministicLPModel:
                 res_object.objective_value += storage_value + contract_value
 
     def get_objective(self):
-        status = self.solve_message['Solver'][0]['Termination condition']
-        if status == TerminationCondition.optimal:
-            return self.inst.objective(), False # No truncation
+        if hasattr(self, 'solve_message') == False:
+            Warning("Model has not been solved yet, no objective to return.")
+            return 0, True
         else:
-            return 0, True # Truncate episode
+            status = self.solve_message['Solver'][0]['Termination condition']
+            if status == TerminationCondition.optimal:
+                return self.inst.objective(), False # No truncation
+            else:
+                return 0, True # Truncate episode
 
     def get_actions(self):
         """ Only the decisions made within the decision horizon are non-recourse. """
@@ -792,8 +815,8 @@ class DecisionRuleModel(HourlyRecourseModel):
             b.out_flow = pyo.Var(self.model.T, domain=pyo.Reals, bounds=(-b.capacity, b.capacity * self.allow_spot_buy))
             b.linear_weights = pyo.Var(self.model.price_domains, self.model.features, self.model.feature_hours, domain=pyo.Reals)
             b.da_buy = pyo.Var(self.model.T, domain=pyo.Reals, bounds=(-b.capacity, b.capacity * self.allow_spot_buy))
-            b.da_positive_exceedance = pyo.Var(self.model.T, domain=pyo.NonNegativeReals)
-            b.da_negative_exceedance = pyo.Var(self.model.T, domain=pyo.NonNegativeReals)
+            # b.da_positive_exceedance = pyo.Var(self.model.T, domain=pyo.NonNegativeReals)
+            # b.da_negative_exceedance = pyo.Var(self.model.T, domain=pyo.NonNegativeReals)
             b.ba_buy = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.capacity))
             b.ba_sell = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.capacity))
             def balancing_rule(m, t):
@@ -817,7 +840,7 @@ class DecisionRuleModel(HourlyRecourseModel):
             price = pyo.value(inst.feature_data[inst.features.at(-1), t])
             _pd = sum(pyo.value(val) < price for d,val in inst.domain_prices.items())
             da_buy_decision_rule = sum(b.linear_weights[_pd, f, h] * inst.feature_data[f, t] for f in inst.features)
-            return b.da_buy[t] == da_buy_decision_rule - b.da_positive_exceedance[t] + b.da_negative_exceedance[t]
+            return b.da_buy[t] == da_buy_decision_rule # - b.da_positive_exceedance[t] + b.da_negative_exceedance[t]
         self.inst.linear_mapping_constraint = pyo.Constraint(self.inst.dayaheads, self.inst.T, rule=linear_mapping_rule)
         
         def price_domain_rule(inst, da, _pd, t):
@@ -827,26 +850,29 @@ class DecisionRuleModel(HourlyRecourseModel):
                 b = inst.dayaheadBlocks[da]
                 h = pyo.value(inst.T_datetime[t]).hour % self.n_rules
                 lambda_price = pyo.value(inst.domain_prices[_pd-1])
-                low_price_domain_buy = lambda_price * b.linear_weights[_pd-1, inst.features.at(-1), h] + sum(b.linear_weights[_pd-1, f, h] * inst.feature_data[f, t] for f in inst.features if f < len(inst.features)-1)
-                high_price_domain_buy = lambda_price * b.linear_weights[_pd, inst.features.at(-1), h] + sum(b.linear_weights[_pd, f, h] * inst.feature_data[f, t] for f in inst.features if f < len(inst.features)-1)
+                low_price_domain_buy = (lambda_price * b.linear_weights[_pd-1, inst.features.at(-1), h] + 
+                                         sum(b.linear_weights[_pd-1, f, h] * inst.feature_data[f, t]
+                                             for f in inst.features if f < len(inst.features)-1))
+                high_price_domain_buy = (lambda_price * b.linear_weights[_pd, inst.features.at(-1), h] + 
+                                         sum(b.linear_weights[_pd, f, h] * inst.feature_data[f, t] 
+                                             for f in inst.features if f < len(inst.features)-1))
                 return high_price_domain_buy <= low_price_domain_buy # ensure that what we bid to buy in the high price domain is lower than in the low price domain.
         self.inst.price_domain_constraint = pyo.Constraint(self.inst.dayaheads, self.inst.price_domains, self.inst.T, rule=price_domain_rule)
         
-        def positive_exceedance_rule(inst, da, t):
-            b = inst.dayaheadBlocks[da]
-            ppa_power = sum(inst.ppaBlocks[ppa].out_flow[t] for ppa in inst.ppas)
-            gcp_cap = inst.linkBlocks["Grid Connection Point"].capacity/inst.linkBlocks["Grid Connection Point"].rate
-            power_buy_cap = gcp_cap - ppa_power
-            return b.da_positive_exceedance[t] >= b.da_buy[t] - power_buy_cap
-        self.inst.positive_exceedance_constraint = pyo.Constraint(self.inst.dayaheads, self.inst.T, rule=positive_exceedance_rule)
+        # def positive_exceedance_rule(inst, da, t):
+        #     b = inst.dayaheadBlocks[da]
+        #     ppa_power = sum(inst.ppaBlocks[ppa].out_flow[t] for ppa in inst.ppas)
+        #     gcp_cap = inst.linkBlocks["Grid Connection Point"].capacity/inst.linkBlocks["Grid Connection Point"].rate
+        #     power_buy_cap = gcp_cap - ppa_power
+        #     return b.da_positive_exceedance[t] >= b.da_buy[t] - power_buy_cap
+        # self.inst.positive_exceedance_constraint = pyo.Constraint(self.inst.dayaheads, self.inst.T, rule=positive_exceedance_rule)
         
-        def negative_exceedance_rule(inst, da, t):
-            b = inst.dayaheadBlocks[da]
-            ppa_power = sum(inst.ppaBlocks[ppa].out_flow[t] for ppa in inst.ppas)
-            power_sell_cap = ppa_power
-            return b.da_negative_exceedance[t] >= -b.da_buy[t] - power_sell_cap
-
-        self.inst.negative_exceedance_constraint = pyo.Constraint(self.inst.dayaheads, self.inst.T, rule=negative_exceedance_rule)
+        # def negative_exceedance_rule(inst, da, t):
+        #     b = inst.dayaheadBlocks[da]
+        #     ppa_power = sum(inst.ppaBlocks[ppa].out_flow[t] for ppa in inst.ppas)
+        #     power_sell_cap = ppa_power
+        #     return b.da_negative_exceedance[t] >= -b.da_buy[t] - power_sell_cap
+        # self.inst.negative_exceedance_constraint = pyo.Constraint(self.inst.dayaheads, self.inst.T, rule=negative_exceedance_rule)
         
         self.updated_constraints += ["linear_mapping_constraint", "price_domain_constraint"]
     
@@ -1212,6 +1238,27 @@ class StochasticRecourseModel(HourlyRecourseModel):
         self.inst.shortfall_constraint = pyo.Constraint(self.inst.contracts, self.inst.S, self.inst.T, rule=contract_shortfall_rule)
 
         if self.model_type == "recourse DA":
+            # & Ensure that the buy volumes are non-increasing with price.
+            # * Implement non-decreasing (with price) day-ahead bids here.
+            # Precompute sorted scenario order for each time t
+            sorted_scenarios = { 
+                t: [s for price, s in sorted(
+                    [(pyo.value(self.inst.electricity_price[s, t]), s) for s in self.inst.S]
+                )]
+                for t in self.inst.T if pyo.value(self.inst.fixed_da[t]) == 0
+            }
+
+            ordering_pairs = [] # Contains all relevant sets of (scenario[n], scenario[n+1], t)
+            for t, scenario_order_t in sorted_scenarios.items():
+                for n in range(len(scenario_order_t) - 1):
+                    ordering_pairs.append((scenario_order_t[n], scenario_order_t[n+1], t))
+            # Convert to Pyomo Set
+            self.inst.ORDERING_PAIRS = pyo.Set(initialize=ordering_pairs, dimen=3)
+            
+            def bid_ordering_rule(inst, prev_s, s, t):
+                return inst.dayaheadBlocks["ElectricitySpot"].da_buy[prev_s, t] >= inst.dayaheadBlocks["ElectricitySpot"].da_buy[s, t]
+            self.inst.bid_ordering_constraint = pyo.Constraint(self.inst.ORDERING_PAIRS, rule=bid_ordering_rule)
+
             def fix_da_rule(inst, da, s, t):
                 if pyo.value(inst.fixed_da[t]) == 1:
                     return inst.dayaheadBlocks[da].da_buy[s,t] == inst.cleared_power[t]
@@ -1298,10 +1345,7 @@ class StochasticRecourseModel(HourlyRecourseModel):
 
     def _save_solution(self):
         """ Save decision results, which are non-recourse, and planning results, some of which are recourse decisions. """
-
         self._calculate_expected_el_revenue()
-        if self.model_type != "recourse DA":
-            self.decision_results.dayahead_buy = [pyo.value(self.inst.dayaheadBlocks['ElectricitySpot'].da_buy[t]) for t in self.inst.T_fix_dayahead]
 
         if self.n_scenarios == 1 or self.model_type == "non-recourse flows":
             time_slices = [self.inst.T_fix_recourse]
@@ -1316,13 +1360,14 @@ class StochasticRecourseModel(HourlyRecourseModel):
                 res_object.spot_power      = np.asarray([pyo.value(self.inst.dayaheadBlocks['ElectricitySpot'].out_flow[0, t]) for t in t_slice])
                 res_object.da_buy          = np.asarray([pyo.value(self.inst.dayaheadBlocks['ElectricitySpot'].da_buy[t]) for t in t_slice])
                 res_object.ba_buy          = np.asarray([pyo.value(self.inst.dayaheadBlocks['ElectricitySpot'].ba_buy[0, t]) for t in t_slice])
-                res_object.ba_sell          = np.asarray([pyo.value(self.inst.dayaheadBlocks['ElectricitySpot'].ba_sell[0, t]) for t in t_slice])
+                res_object.ba_sell         = np.asarray([pyo.value(self.inst.dayaheadBlocks['ElectricitySpot'].ba_sell[0, t]) for t in t_slice])
                 res_object.ppa_power       = {name : np.asarray([pyo.value(self.inst.ppaBlocks[name].out_flow[0, t]) for t in t_slice]) for name in self.inst.ppas}
                 res_object.ppa_costs       = sum(pyo.value(b.out_flow[0, t]) * pyo.value(b.price) for _, b in self.inst.ppaBlocks.items() for t in t_slice)
                 res_object.storage_soc     = {name : np.asarray([pyo.value(self.inst.storageBlocks[name].soc[0, t]) for t in t_slice]) for name in self.inst.storages}
                 res_object.storage_inflow  = {name : np.asarray([pyo.value(self.inst.storageBlocks[name].in_flow[0, t]) for t in t_slice]) for name in self.inst.storages}
                 res_object.storage_outflow = {name : np.asarray([pyo.value(self.inst.storageBlocks[name].out_flow[0, t]) for t in t_slice]) for name in self.inst.storages}
                 res_object.link_production = {name : np.asarray([pyo.value(self.inst.linkBlocks[name].out_flow[0, t]) for t in t_slice]) for name in self.inst.links}
+                res_object.power_consumption = np.asarray([pyo.value(self.inst.linkBlocks['Grid Connection Point'].in_flow[0, t]) for t in t_slice])
 
                 # Contractually related results:
                 res_object.shipments          = {cont : np.asarray([pyo.value(self.inst.contractBlocks[cont].shipment[0, t]) for t in t_slice])

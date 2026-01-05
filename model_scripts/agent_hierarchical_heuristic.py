@@ -520,19 +520,46 @@ class RecourseAgent(StochasticHA):
             accepted_volumes = []
             for t in range(self.decision_horizon):
                 price_volume_pairs = [[data[None]["electricity_price"][(s,t+self.da_bid_model.fixed_horizon)], desired_volumes[s][t]] for s in self.da_bid_model.inst.S]
-                sorted_bids = sorted(price_volume_pairs) # Sorts ascending by first index (price)
-                # & Ensure that the buy volumes are non-increasing with price.
-                for ix, (price, vol) in enumerate(sorted_bids[:-1]):
-                    next_price, next_vol = sorted_bids[ix+1]
-                    sorted_bids[ix] = [price, min(vol, next_vol)]
+                sorted_bids = np.asarray(sorted(price_volume_pairs)) # Sorts ascending by first index (price)
                 sorted_prices = sorted_bids[:,0]
                 sorted_volumes = sorted_bids[:,1]
                 accepted_volume = sorted_volumes[min(len(sorted_volumes)-1,sum(sorted_prices<newly_realized_prices[t]))]
                 accepted_volumes.append(accepted_volume)
+            if self.documentation:
+                fig, ax = plt.subplots(figsize=(16,12))
+                plt.title(f"Bid, realized price, and resulting Day-Ahead Power")
+                min_price, max_price = 100, 0
+                min_volume, max_volume = 0, 1
+                for t in range(self.decision_horizon):
+                    rp = newly_realized_prices[t]
+                    price_volume_pairs = [[data[None]["electricity_price"][(s,t+self.da_bid_model.fixed_horizon)], desired_volumes[s][t]] for s in self.da_bid_model.inst.S]
+                    sorted_bids = np.asarray(sorted(price_volume_pairs)) # Sorts ascending by first index (price)
+                    prices = sorted_bids[:,0]
+                    max_price = max(max_price, max(prices))
+                    min_price = min(min_price, min(prices))
+                    volumes = sorted_bids[:,1]
+                    max_volume = max(max_volume, max(volumes))
+                    min_volume = min(min_volume, min(volumes))
+                    if t == 12:
+                        lbl = "Bidding curves"
+                    else:
+                        lbl = ""
+                    ax.step([-500]+list(prices), [volumes[0]]+list(volumes), label=lbl, color=(0.1,1/self.decision_horizon*t,0.1))
+                    ax.annotate(str(t), (rp, accepted_volumes[t]), color="red")
+                    # ax.axvline(rp, color="red", linestyle="--", label="Cleared Price")
+                    # ax.axhline(accepted_volumes[t], color="green", linestyle="-.", label="Power Bought")
+                ax.scatter(10000,0,color="red",marker="x",label="Clearing")
+                ax.axvline(self.ammonia_strike_price/self.electricity_consumption["ammonia"], color="black", alpha=0.7, linestyle="--", label="Internal Strike Price (NH3)")
+                plt.xlim(min_price-0.05*np.abs(min_price), max_price+0.05*np.abs(max_price))
+                plt.ylim(min_volume-0.05*np.abs(min_volume), max_volume+0.05*np.abs(max_volume))
+                plt.ylabel("Day ahead bid buy (MW)")
+                plt.xlabel("€/MWh")
+                plt.grid(True)
+                plt.legend()
+                plt.savefig(f'documentation/heuristic_agent/recourseDA_bidding_agent.png')
+                plt.close()
         else:
             accepted_volumes = self.da_bid_model.get_da_volumes() #
-        
-        self.previous_da_decisions = np.asarray(accepted_volumes[-12:])
         
         return accepted_volumes, newly_realized_prices
 
@@ -541,7 +568,7 @@ class RecourseAgent(StochasticHA):
             self.hourly_model.decision_horizon = 12
             self.hourly_model.fixed_horizon = 0
             self.hourly_model.initialize_model()
-        if k == 1:
+        elif k == 1:
             self.hourly_model.decision_horizon = self.decision_horizon
             self.hourly_model.fixed_horizon = 12
             self.hourly_model.initialize_model()
@@ -570,6 +597,9 @@ class RecourseAgent(StochasticHA):
         
         # 2. Get recourse decisions using cleared bids.
         hourly_decisions = self._fix_hourly_decisions(obs, k, time, info, data=data)
+
+        self.previous_da_decisions = np.asarray(newly_accepted_volumes[-12:])
+
         return hourly_decisions
 
     def pi(self, obs, k, info:dict):
@@ -585,10 +615,15 @@ class RecourseAgent(StochasticHA):
         return np.asarray(actions)
 
     def __repr__(self):
-        return self.__class__.__name__ + str(self.n_scenarios)
+        rep = self.__class__.__name__ + str(self.n_scenarios) 
+        if self.da_model_type == "recourse DA":
+            rep += "_DAbidding"
+        return rep
 
 
 class StrikePriceBiddingAgent(RecourseAgent):
+    """ Bids a bidding curve based on estimated strike prices.
+    """
     def __init__(self, 
                  env:RFPRecourseEnv, 
                  *args,
@@ -676,6 +711,9 @@ class StrikePriceBiddingAgent(RecourseAgent):
 
 
 class BiddingCurveAgent(RecourseAgent):
+    """ Uses a Linear Decision Rule model to learn a bidding curve mapping features to bid volumes.
+    The features used are bias term, price forecast, PPA power forecast, and optionally realized prices.
+    """
     def __init__(self, 
                  env:RFPRecourseEnv|RFPYearEnv, 
                  *args, 
@@ -689,7 +727,7 @@ class BiddingCurveAgent(RecourseAgent):
                  n_features=3,
                  n_price_domains=1,
                  domain_prices=[],
-                 price_steps=200,
+                 price_steps=30, # Max 200
                  mode="train",
                  no_train=False,
                  **kwargs):
@@ -812,21 +850,23 @@ class BiddingCurveAgent(RecourseAgent):
         accepted_volumes = np.asarray([volumes[t, realized_idxs[t]] for t in range(T)]) # Positive is buy, negative is sell.
 
         if self.documentation:
-            t=15
-            rp = real_prices[t]
-            plt.title(f"Bid, realized price, and resulting Day-Ahead Power ({t}:00)")
-            plt.step(list(prices), list(volumes[t]), label="Bidding curve")
-            plt.axvline(self.domain_prices[0], color="black", alpha=0.3, linestyle="-", label="Price Domain Border")
-            plt.axvline(rp, color="red", linestyle="--", label="Cleared Price")
-            plt.axhline(accepted_volumes[t], color="green", linestyle="-.", label="Power Bought")
-            plt.xlim(max(self.min_seen_price, rp*0.5),min(self.max_seen_price*1.1, rp*3))
-            plt.ylim(min(volumes[t]*1.1), max(volumes[t]*1.1))
-            plt.ylabel("Day ahead bid buy (MW)")
-            plt.xlabel("€/MWh")
-            plt.grid(True)
-            plt.legend()
-            plt.savefig(f'documentation/heuristic_agent/domain{self.n_price_domains}_bidding_agent.png')
-            plt.close()
+            linestyles = ['-', '--', '-.', ':']
+            for t in range(T):
+                rp = real_prices[t]
+                plt.title(f"Bid, realized price, and resulting Day-Ahead Power ({t}:00)")
+                plt.step(list(volumes[t]), list(prices), label="Bidding curve", color="blue")
+                for ix in range(len(self.domain_prices)):
+                    plt.axhline(self.domain_prices[ix], color="black", alpha=0.3, linestyle=linestyles[ix], label=f"Price Domain {ix+1} Border")
+                plt.axhline(rp, color="red", linestyle="--", label="Cleared Price")
+                plt.axvline(accepted_volumes[t], color="green", linestyle="-.", label="Power Bought")
+                plt.ylim(self.min_seen_price, self.max_seen_price)
+                plt.xlim(min(volumes[t]*1.1), max(volumes[t]*1.1))
+                plt.ylabel("Price [€/MWh]")
+                plt.xlabel("Volume - Buying [MW]")
+                plt.grid(True)
+                plt.legend()
+                plt.savefig(f'documentation/ldr_agent/D{self.n_price_domains}_hour{t}.png')
+                plt.close()
 
         self.previous_da_decisions = np.asarray(accepted_volumes[-12:])
 
@@ -850,7 +890,7 @@ class BiddingCurveAgent(RecourseAgent):
                 if self.n_price_domains > 2:
                     # Consider possible general idea.
                     # But if it it to dependent on other stuff, then we for sure need to retrain the weights continuously.
-                    self.domain_prices[1] = 1.3 * self.ammonia_strike_price / self.electricity_consumption["ammonia"]
+                    self.domain_prices[1] = 1.4 * self.ammonia_strike_price / self.electricity_consumption["ammonia"]
         actions = self._solve_hourly_decisions(obs=obs, k=k, time=time, info=info) # Day-ahead solving
 
         self._update_logbook()

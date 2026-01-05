@@ -203,6 +203,7 @@ def train(env:Env,
           save_every=None,
           seed=None, # Attempt to set the seed of the random number generator to produce reproducible results.
           continue_trajectories_and_stats=False,
+          starting_episode=None,
           ):
     """This function implements the main training loop as described in (Her25, Subsection 4.4.4).
 
@@ -258,14 +259,19 @@ def train(env:Env,
         stats = load_stats(experiment_name=experiment_name)
 
     with tqdm(total=num_episodes, disable=not verbose, file=sys.stdout, mininterval=int(num_episodes/100) if num_episodes>100 else None) as tq:
-        for i_episode in range(len(stats),num_episodes):
+        ep_start = len(stats)
+        if starting_episode is not None:
+            ep_start = starting_episode
+        stats = stats[:ep_start]
+        trajectories = trajectories[:ep_start]
+        for i_episode in range(ep_start,num_episodes):
             if break_outer:
                 break
             if isinstance(seed, list):
                 seed_ = seed[i_episode]
             else:
                 seed_ = seed
-            obs, info_s = env.reset(seed=seed_) # Reset the environment at the beginning of each episode. 
+            obs, info_s = env.reset(seed=seed_, options={"scenario_number": i_episode}) # Reset the environment at the beginning of each episode. 
 
             reward = []
             trajectory = Trajectory(time=[], state=[], action=[], reward=[], env_info=[])

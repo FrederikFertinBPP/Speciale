@@ -21,7 +21,7 @@ def main():
     # agent = BiddingCurveAgent(env=env, solver=solver, documentation=True, guideline=None,
     #                           n_price_domains=2, domain_prices=[80],)
     agent = BiddingCurveAgent(env=env, solver=solver, documentation=True, guideline=None,
-                              n_price_domains=3, domain_prices=[80, 80*1.3],)
+                              n_price_domains=3, domain_prices=[80, 80*1.4],)
     
     experiment_name = "_".join(["train", str(agent), "spot", str(allow_spot_buy)])
     print("Start experiment: ", experiment_name)

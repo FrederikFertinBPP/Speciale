@@ -229,7 +229,8 @@ class PriceSimulationTool(SimulationTool):
         if self.documentation: self.plot_impact_of_deseason(df, impact, residuals, name=self.tool_type + "removing_seasonal_effect")
         return residuals, avg_months
     
-    def _del_weekday_and_weekend_pattern(self, df):
+    def _del_weekday_and_weekend_pattern(self, df_):
+        df = df_.copy()
         time_info = self.train_data
         weekend_data = df.loc[time_info.is_weekend, self.price_tag]
         weekday_data = df.loc[time_info.is_weekday, self.price_tag]
@@ -452,7 +453,7 @@ class SolarSimulationTool(RenewablesSimulationTool):
 
         # Prep 2: Determine average hourly std and average mean hourly std for each month.
         self.monthly_mean_max = self.hourly_monthly_mean_profiles.groupby(level=0).max()
-        self.monthly_std_means = self.hourly_monthly_std_profiles.groupby(level=0).mean()
+        # self.monthly_std_means = self.hourly_monthly_std_profiles.groupby(level=0).mean()
 
         if self.documentation:
             fig, axs = plt.subplots(4,3, figsize=(15,10), sharex=True, sharey=True)
@@ -464,6 +465,37 @@ class SolarSimulationTool(RenewablesSimulationTool):
                     actual_values = df.loc[(df.index.day == day) & (df.index.month == month), self.vre_tag].values[:24]
                     ax.scatter(np.arange(1,25), actual_values - month_mean_values, s=1)
             plt.savefig(f'documentation/{self.forecaster.plot_dir}monthly_variation_from_daily_mean.png')
+            plt.close()
+
+            months = ["January", "February", "March", "April", "May", "June", 
+                      "July", "August", "September", "October", "November", "December"]
+            fig, axs = plt.subplots(3,4, figsize=(15,10), sharex=True, sharey=True)
+            axs = axs.flatten()
+            axs[0].set_ylim(0,1)
+            axs[0].set_xlim(6,20)
+            axs[0].set_ylabel('Capacity Factor')
+            axs[4].set_ylabel('Capacity Factor')
+            axs[8].set_ylabel('Capacity Factor')
+            axs[8].set_xlabel('Hour of Day')
+            axs[9].set_xlabel('Hour of Day')
+            axs[10].set_xlabel('Hour of Day')
+            axs[11].set_xlabel('Hour of Day')
+            for month in range(1,13):
+                ax = axs[month-1]
+                ax.title.set_text(months[month-1])
+                month_mean_values = self.hourly_monthly_mean_profiles.loc[(month), self.vre_tag].values
+                month_std_values = self.hourly_monthly_std_profiles.loc[(month), self.vre_tag].values
+                month_max_values = self.hourly_monthly_max_profiles.loc[(month), self.vre_tag].values
+                month_min_values = self.hourly_monthly_min_profiles.loc[(month), self.vre_tag].values
+                ax.fill_between(np.arange(1,25), month_mean_values - month_std_values, month_mean_values + month_std_values, color='lightgray', label='Mean ± Std Dev')
+                ax.plot(np.arange(1,25), month_mean_values, label='Mean Profile', color='blue')
+                ax.plot(np.arange(1,25), month_max_values, linestyle='dashed', color='gray', label='Min-Max Range')
+                ax.plot(np.arange(1,25), month_min_values, linestyle='dashed', color='gray')
+                ax.set_xticks([6,10,15,20])
+            h, l = ax.get_legend_handles_labels()
+            plt.legend(handles=h, labels=l, loc='upper center', bbox_to_anchor=(-1, -0.3), ncol=3)
+            plt.tight_layout()
+            plt.savefig(f'documentation/{self.forecaster.plot_dir}monthly_profiles.png')
             plt.close()
 
         # Step 2: Establish a time series of daily maximum values
@@ -859,7 +891,7 @@ class WindSimulationTool(RenewablesSimulationTool):
         # We assume that the absolute maximum streak we can get is 2 days of continuously decreasing or increasing wind
         # Maximum observed streak is 32 hours of continuosly increasing wind (an outlier from 24).
         max_len = 24*3
-        self.domains = np.quantile(df, [0,0.05,0.25,0.5,0.65,0.8,0.95]) # Create equally sized domains, 4 domains
+        self.domains = np.quantile(df, [0,0.1,0.25,0.75,0.9]) # Create equally sized domains, 4 domains
         self.domains[0] = -np.inf
         posIntLengthDist = np.zeros((max_len, len(self.domains), 3))  # columns: length, count, probability
         negIntLengthDist = np.zeros((max_len, len(self.domains), 3))
@@ -900,19 +932,26 @@ class WindSimulationTool(RenewablesSimulationTool):
         negIntLengthDists = negIntLengthDist[:minMaxIntLength + 1 , :, 2]
 
         if self.documentation:
-            plt.plot(np.sum(posIntLengthDist[:minMaxIntLength, :, 2], axis=1)/len(self.domains), label="Increasing wind periods (all)", color='blue')
-            plt.plot(np.sum(negIntLengthDist[:minMaxIntLength, :, 2], axis=1)/len(self.domains), label="Decreasing wind periods (all)", color='red')
+            plt.plot(np.sum(posIntLengthDist[:minMaxIntLength, :, 2] * 100, axis=1)/len(self.domains), label="Increasing wind periods (all)", color='blue')
+            plt.plot(np.sum(negIntLengthDist[:minMaxIntLength, :, 2] * 100, axis=1)/len(self.domains), label="Decreasing wind periods (all)", color='red')
+            plt.xlabel("Interval Length (hours)")
+            plt.ylabel("Probability (%)")
             plt.legend()
             plt.savefig(f'documentation/{self.forecaster.plot_dir}difference_streak_probability.png')
             plt.close()
             
             fig, axs = plt.subplots(2, 1, sharex=True)
             for dom in range(len(self.domains)):
-                axs[0].plot(posIntLengthDists[:, dom], label=f"In domain ({dom})")
-                axs[1].plot(negIntLengthDists[:, dom], label=f"In domain ({dom})")
+                axs[0].plot(posIntLengthDists[:, dom] * 100, label=f"In domain ({dom+1})", alpha=0.6)
+                axs[1].plot(negIntLengthDists[:, dom] * 100, label=f"In domain ({dom+1})", alpha=0.6)
+            axs[0].plot(np.sum(posIntLengthDist[:minMaxIntLength+1, :, 2] * 100, axis=1)/len(self.domains), label="All domains", color='black')
+            axs[1].plot(np.sum(negIntLengthDist[:minMaxIntLength+1, :, 2] * 100, axis=1)/len(self.domains), label="All domains", color='black')
             axs[0].legend(title="Increasing wind period probabilities", loc='upper right', fontsize='small', ncols=2)
             axs[1].legend(title="Decreasing wind period probabilities", loc='upper right', fontsize='small', ncols=2)
             axs[1].set_xlabel("Interval Length (hours)")
+            axs[0].set_ylabel("Probability (%)")
+            axs[1].set_ylabel("Probability (%)")
+            axs[0].set_xlim(1, minMaxIntLength)
             plt.savefig(f'documentation/{self.forecaster.plot_dir}difference_streak_probability_domains.png')
             plt.close()
 
@@ -1125,7 +1164,7 @@ class DataForecaster:
         # self.y_train, self.y_test = self.train_data[[self.price_tag]], self.test_data[[self.price_tag]]
         # self.X_train, self.X_test = self.train_data[feature_tags], self.test_data[feature_tags]
         self.t_zero = self.train_data.index[0].timestamp() # To be used when fitting trend and later on when reapplying trend.
-        self.t_init =  self.train_data.index[-1] + pd.Timedelta(1, 'hour')
+        self.t_init = self.train_data.index[-1] + pd.Timedelta(1, 'hour')
 
     def set_seed(self, seed):
         self.seed = seed
