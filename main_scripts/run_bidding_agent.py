@@ -19,13 +19,9 @@ def main():
 
     env = get_env(RFPRecourseEnv, allow_spot_buy=allow_spot_buy, balancing_market=True, verbose=True ,load_data=True)
     
-    agent = BiddingCurveAgent(env=env,
-                            solver=solver,
-                            documentation=False,
-                            guideline=guideline,
-                            planning_horizon=planning_horizon,
-                            n_scenarios=n_scenarios,
-                            mode="eval",
+    agent = BiddingCurveAgent(env=env, solver=solver, documentation=False,
+                            guideline=guideline, planning_horizon=planning_horizon, n_scenarios=n_scenarios,
+                            mode="eval", no_train=True,
                             )
     training_experiment = "_".join(["train", str(agent), "spot", str(allow_spot_buy)])
     agent.load(os.getcwd() + f"/models/rl_models/{training_experiment}")

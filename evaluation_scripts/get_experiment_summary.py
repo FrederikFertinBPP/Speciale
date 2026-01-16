@@ -5,31 +5,14 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from common_scripts.utils import load_trajectories, load_stats, cache_read
+from common_scripts.utils import load_trajectories, load_stats
 from common_scripts.RFP_initialization import create_rfp
 from model_scripts.hourly_models import HourlyDeterministicLPModel
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
-
-sns.set_theme("notebook", font_scale=1.5, style="darkgrid")
-plt.rcParams['font.size'] = 16
-# set legend fontsize to 14
-plt.rcParams['legend.fontsize'] = 18
-# set the font weight of the legend to bold
-plt.rcParams['legend.title_fontsize'] = 18
-# set the font size of the x and y labels to 14
-plt.rcParams['axes.labelsize'] = 18
-# set the font weight of the x and y labels to bold
-plt.rcParams['axes.labelweight'] = 'bold'
-# set the font size of the x and y ticks to 12
-plt.rcParams['xtick.labelsize'] = 16
-plt.rcParams['ytick.labelsize'] = 16
-# set the font size of the title to 16
-plt.rcParams['axes.titlesize'] = 18
-# set the font weight of the title to bold
-plt.rcParams['axes.titleweight'] = 'bold'
+from common_scripts.utils import set_plotting_style
+set_plotting_style()
 
 # https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=10839633&casa_token=-WRwu6R4PLkAAAAA:S8T2feRrOOVXyI0B3crc0-U9FuOidkP-GTvj-mnKkvcuyvo7C3hp5eNw-5UIxHJijxWzoJZz&tag=1
 
@@ -51,15 +34,14 @@ plt.rcParams['axes.titleweight'] = 'bold'
     Likelihood of contract defaulting
 """
 
-rfp = create_rfp()
-
-def get_hindsight_solution(trajectory, stats, model_class=HourlyDeterministicLPModel):
+def get_hindsight_solution(trajectory, stats, rfp, model_class=HourlyDeterministicLPModel):
     horizon_days = len(trajectory.reward)
     time_index = pd.to_datetime(pd.date_range(start=trajectory.env_info[0]['time'], end=trajectory.env_info[-1]['time'], freq='h')[:-1], utc=True)
     wind_profile, solar_profile, electricity_price = [], [], []
+    solar_cap, wind_cap = stats['solarpower_capacity'], stats['windpower_capacity']
     for t in range(1, horizon_days+1):
-        wind_profile += list(trajectory.env_info[t]['ppa_power']['WindPower'] / stats['windpower_capacity'])
-        solar_profile += list(trajectory.env_info[t]['ppa_power']['SolarPower'] / stats['solarpower_capacity'])
+        wind_profile += list(trajectory.env_info[t]['ppa_power']['WindPower'] / wind_cap if wind_cap>0 else np.zeros(len(trajectory.env_info[t]['ppa_power']['WindPower'])))
+        solar_profile += list(trajectory.env_info[t]['ppa_power']['SolarPower'] / solar_cap if solar_cap>0 else np.zeros(len(trajectory.env_info[t]['ppa_power']['SolarPower'])))
         electricity_price += list(trajectory.env_info[t]['electricity_price'])
 
     horizon = horizon_days * 24
@@ -88,7 +70,7 @@ def get_hindsight_solution(trajectory, stats, model_class=HourlyDeterministicLPM
     pfm.run()
     return pfm
 
-def get_realization_summary(trajectory, stats):
+def get_realization_summary(trajectory, stats, rfp):
     horizon_days = len(trajectory.reward)
     T = range(1, horizon_days+1)
 
@@ -161,7 +143,6 @@ def get_realization_summary(trajectory, stats):
     emissions_summary["averages"] = {}
     emissions_summary["averages"]["buying"] = emissions_summary["totals"]["buying"] / el_bought
     emissions_summary["averages"]["selling"] = emissions_summary["totals"]["selling"] / el_sold
-    emissions_summary["averages"]["selling"] = emissions_summary["totals"]["selling"] / el_sold
 
     ### * PPA Power Overview * ###
     ppa_profile = {}
@@ -172,11 +153,14 @@ def get_realization_summary(trajectory, stats):
             l += list(trajectory.env_info[t]['ppa_power'][key])
         ppa_profile[key] = np.asarray(l)
     ppa_production = {key: np.sum(ppa_profile[key]) for key in ppas}
-    ppa_prices = {key: stats['ppas'][key].parameters.get('price') for key in ppas}
+    
+    # ppa_prices = {key: stats['ppas'][key].parameters.get('price') for key in ppas} # Change this line if we want to change PPA price assumption. 
+    ppa_prices = {key: rfp.get_ppa(key).parameters.get('price') for key in ppas} 
+    
     ppa_cost = {key: ppa_production[key] * ppa_prices[key] for key in ppas}
     ppa_capacities = {key: stats['ppas'][key].parameters.get('capacity') for key in ppas}
-    ppa_capacity_factor = {key: np.mean(ppa_profile[key]) / ppa_capacities[key] for key in ppas}
-    ppa_capture_prices = {key: np.sum(ppa_profile[key] * da_prices) / ppa_production[key] for key in ppas}
+    ppa_capacity_factor = {key: (np.mean(ppa_profile[key]) / ppa_capacities[key] if ppa_capacities[key] > 0 else 0.0) for key in ppas}
+    ppa_capture_prices = {key: (np.sum(ppa_profile[key] * da_prices) / ppa_production[key] if ppa_capacities[key] > 0 else 0.0) for key in ppas}
     capture_price_summary["ppa"] = ppa_capture_prices
     emissions_summary["totals"]["baseload_ppa"] = emissions_summary["average"] * sum(ppa_production[key] for key in ppas if not(stats['ppas'][key].parameters.get("simulated")))
     emissions_summary["balance"] = emissions_summary["totals"]["buying"] + emissions_summary["totals"]["baseload_ppa"] - emissions_summary["totals"]["selling"]
@@ -185,6 +169,10 @@ def get_realization_summary(trajectory, stats):
     power_contracted = sum(ppa_production.values())
 
     hydrogen_produced = np.sum([sum(trajectory.env_info[t]['link_productions']['Electrolyzer']) for t in T])
+
+    ammonia_produced = np.sum([sum(trajectory.env_info[t]['link_productions']['Haber Bosch Plant']) for t in T])
+
+    emissions_summary["fuel_emissions_intensity"] = emissions_summary["balance"] / (hydrogen_produced * (120/3.6) + (18.6/3.6 - (120/3.6)/5.5) * ammonia_produced)
 
     revenue_exposure = el_sold / (el_sold + power_consumption)
     cost_exposure = el_bought / (el_bought + power_contracted)
@@ -205,9 +193,9 @@ def get_realization_summary(trajectory, stats):
     return (spot_summary, capture_price_summary, emissions_summary, ppa_capacity_factor, contract_revenues, contract_penalties,
             ppa_cost, el_revenue, contracted_revenue, contract_penalty,
             revenue_exposure, cost_exposure, short_exposure, long_exposure, balancing_exposure,
-            emissions_summary["balance"], realized_total_revenue, hydrogen_produced)
+            emissions_summary["fuel_emissions_intensity"], realized_total_revenue, hydrogen_produced)
 
-def print_trajectory_summary(trajectory, stats, model_class = HourlyDeterministicLPModel, opt_model=None):
+def print_trajectory_summary(trajectory, stats, rfp, model_class = HourlyDeterministicLPModel, opt_model=None):
     normalized = stats.get("normalized",False)
     print("\n----------------------------------\n")
     print("Total reward: ", np.round(sum(trajectory.reward)*1e-6, 2), " M€")
@@ -215,11 +203,11 @@ def print_trajectory_summary(trajectory, stats, model_class = HourlyDeterministi
     (spot_summary, capture_price_summary, emissions_summary, ppa_capacity_factor, contract_revenues, contract_penalties,
             ppa_cost, el_revenue, contracted_revenue, contract_penalty,
             revenue_exposure, cost_exposure, short_exposure, long_exposure, balancing_exposure,
-            emissions_balance, realized_total_revenue, hydrogen_produced) = get_realization_summary(trajectory=trajectory, stats=stats)
+            emissions_intensity, realized_total_revenue, hydrogen_produced) = get_realization_summary(trajectory=trajectory, stats=stats, rfp=rfp)
 
     #%% Electricity revenue summary
     if opt_model is None:
-        opt_model = get_hindsight_solution(trajectory=trajectory, stats=stats, model_class=model_class)
+        opt_model = get_hindsight_solution(trajectory=trajectory, stats=stats, rfp=rfp, model_class=model_class)
     opt_el_revenue = opt_model.decision_results.exp_el_revenue
     print("\n----------------------------------\n")
     print("Achieved electricity revenue:\t", round(spot_summary["revenue"]["total"]))
@@ -264,13 +252,13 @@ def print_trajectory_summary(trajectory, stats, model_class = HourlyDeterministi
     ebitda = realized_profits
     contracted_revenue -= contract_penalty
     contracted_revenue_share = contracted_revenue / (contracted_revenue + spot_summary["revenue"]["total"])
-    runtime = trajectories[ix].env_info[-1].get("episode_runtime",0)
+    runtime = trajectory.env_info[-1].get("episode_runtime",0)
 
     trajectory_summary = {"Optimal Profit [€]": optimal_profits, "Contract Defaulting [€]": contract_penalty,
                         "Profit Percentage [%]": profit_percentage, "EBITDA [€]": ebitda,
                         "Short Exposure [%]": short_exposure, "Long Exposure [%]": long_exposure, 
                         "Revenue Exposure [%]": revenue_exposure, "Cost Exposure [%]": cost_exposure, 
-                        "Balancing Exposure [%]": balancing_exposure, "Scope 2 Emissions [tCO2]": emissions_balance,
+                        "Balancing Exposure [%]": balancing_exposure, "Scope 2 Emissions [tCO2/MWh]": emissions_intensity,
                         "Hydrogen Produced [tH2]": hydrogen_produced, "Episode Runtime [s]": runtime,
                         }
 
@@ -292,24 +280,25 @@ if __name__ == '__main__':
                    "test_RecourseAgent5_production_value_ph_96_spot_True",
                    "test_RecourseAgent5_DAbidding_production_value_ph_96_spot_True",
                    "test_StrikePriceBiddingAgent1_SP1_production_value_ph_96_spot_True",
-                   "test_StrikePriceBiddingAgent1_SP5_production_value_ph_96_spot_True",
+                #    "test_StrikePriceBiddingAgent1_SP5_production_value_ph_96_spot_True",
                    "test_BiddingCurveAgent1_D1_ph_96_spot_True",
                    "test_BiddingCurveAgent1_D2_ph_96_spot_True",
                    "test_BiddingCurveAgent1_D3_ph_96_spot_True",
                 )
-    # experiments = ("planningsensitivity_DeterministicHA_production_value_ph_24_spot_True", 
-    #                "planningsensitivity_DeterministicHA_production_value_ph_48_spot_True", 
-    #                "planningsensitivity_DeterministicHA_production_value_ph_72_spot_True", 
-    #                "planningsensitivity_DeterministicHA_production_value_ph_96_spot_True", 
-    #                )
-    experiments = ("test_RecourseAgent5_production_value_ph_96_spot_True",
-                   "test_RecourseAgent5_DAbidding_production_value_ph_96_spot_True",
-                )
+    experiments = ("planningsensitivity_DeterministicHA_production_value_ph_24_spot_True", 
+                   "planningsensitivity_DeterministicHA_production_value_ph_48_spot_True", 
+                   "planningsensitivity_DeterministicHA_production_value_ph_72_spot_True", 
+                   "planningsensitivity_DeterministicHA_production_value_ph_96_spot_True", 
+                   )
+    # experiments = ("test_RecourseAgent5_production_value_ph_96_spot_True",
+    #                "test_RecourseAgent5_DAbidding_production_value_ph_96_spot_True",
+    #             )
     #### We assess the regret of the model:
     # This is the difference in profits between the actions chosen by the agent and the optimal actions
     # chosen by an oracle: A perfect foresight model for the full year.
     # Just load the realized wind, solar, and prices (can be found in trajectory env info)
     # and solve an LP for the full year.
+    rfp = create_rfp()
 
     #%% Trajectory stats:
     if single_experiment_evaluation:
@@ -325,7 +314,7 @@ if __name__ == '__main__':
         ppa_capacity_factors = []
 
         for ix in range(len(trajectories)):
-            opt_model, trajectory_summary, emissions_summary, capture_price_summary, ppa_capacity_factor = print_trajectory_summary(trajectory=trajectories[ix], stats=stats[ix])
+            opt_model, trajectory_summary, emissions_summary, capture_price_summary, ppa_capacity_factor = print_trajectory_summary(trajectory=trajectories[ix], stats=stats[ix], rfp=rfp)
             trajectory_summaries.append(trajectory_summary)
             emissions_summaries.append(emissions_summary)
             capture_price_summaries.append(capture_price_summary)
@@ -350,7 +339,7 @@ if __name__ == '__main__':
             
             for ix in range(len(trajectories)):
                 if exp_ix == 0:
-                    opt_model, trajectory_summary, emissions_summary, capture_price_summary, ppa_capacity_factor = print_trajectory_summary(trajectory=trajectories[ix], stats=stats[ix])
+                    opt_model, trajectory_summary, emissions_summary, capture_price_summary, ppa_capacity_factor = print_trajectory_summary(trajectory=trajectories[ix], stats=stats[ix], rfp=rfp)
                     opt_models.append(opt_model)
                     if documentation:
                         prices = [p.value for p in opt_model.inst.electricity_price.values()]
@@ -376,7 +365,7 @@ if __name__ == '__main__':
                         plt.savefig(f"documentation/PerfectForesightStrategy/duration_curve_{ix}.png")
                         plt.show()
                 else:
-                    _, trajectory_summary, emissions_summary, capture_price_summary, ppa_capacity_factor = print_trajectory_summary(trajectory=trajectories[ix], stats=stats[ix], opt_model=opt_models[ix])
+                    _, trajectory_summary, emissions_summary, capture_price_summary, ppa_capacity_factor = print_trajectory_summary(trajectory=trajectories[ix], stats=stats[ix], rfp=rfp, opt_model=opt_models[ix])
                 print(f"{experiment_name}'s trajectory number {ix} done")
                 trajectory_summaries.append(trajectory_summary)
                 emissions_summaries.append(emissions_summary)

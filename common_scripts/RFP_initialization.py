@@ -305,7 +305,7 @@ def create_rfp(scenario_name:str = "default") -> RenewableFuelPlant:
                 rfp.get_ppa(name).parameters[parameter] = new_value
             elif _type == "component":
                 rfp.get_component(name).parameters[parameter] = new_value
-
+    
     return rfp
 
 # if __name__ == "__main__":

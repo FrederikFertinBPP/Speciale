@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from time import time
-from common_scripts.utils import cache_write, cache_read
+from common_scripts.utils import cache_read
 from model_scripts.environment import VRESystemToAssetMapping
 
 import seaborn as sns
@@ -62,7 +62,7 @@ def investigate_annual_duration_curves(simulations, resource='price'):
     plt.close()
 
 documentation = True
-if True:
+if False:
     #%% Data retrieval - There is only data from 2015 and forward for Portugal
     start   = pd.Timestamp('20230101', tz='UTC')
     end     = pd.Timestamp('20241231', tz='UTC')
@@ -77,9 +77,6 @@ if True:
                                 )
     forecaster.build_simulation_models()
 else:
-    rolling_horizon = 4 * 24
-    step_horizon = 24
-
     forecaster = DataForecaster(from_pickle=True, cache_id="Anders")
     forecaster = forecaster.unpickle()
     data_object = forecaster.database

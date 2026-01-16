@@ -2,8 +2,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import os
-import seaborn as sns
-sns.set_theme("notebook")
+from common_scripts.utils import set_plotting_style
+set_plotting_style()
 
 from model_scripts.hourly_models import HourlyDeterministicLPModel, HourlyStochasticLPModel
 from common_scripts import Agent, cache_write
@@ -106,10 +106,12 @@ class DeterministicHA(HierarchicalAgent):
                  solver='gurobi',
                  documentation=False,
                  n_sims=2,
+                 isp_metric='mean',
                  **kwargs,
                  ):
         super().__init__(env=env, writer=writer, planning_horizon=planning_horizon, guideline=guideline, hourly_model_class=hourly_model_class, solver=solver, documentation=documentation, **kwargs)
         self.n_sims = n_sims
+        self.isp_metric = isp_metric
 
         self.electricity_consumption = {}
         self.electricity_consumption['hydrogen'] = self.env.rfp.get_component('Electrolyzer').parameters.get('electricity_consumption', 1/50) # MWh/tH2
@@ -153,9 +155,19 @@ class DeterministicHA(HierarchicalAgent):
             simulation['available_power'] = gcp_cap
         else:
             # Otherwise we are limited to PPAs.
-            simulation['wind']            = self.env.wind_mapper(simulation['wind']) * self.env.wind_capacity
-            simulation['solar']           = self.env.solar_mapper(simulation['solar']) * self.env.solar_capacity
-            simulation['available_power'] = np.clip(simulation['wind'] + simulation['solar'] + self.env.get_baseload_ppa_power(),0,gcp_cap)
+            simulation['available_power'] = 0
+            for ix, (name, ppa) in enumerate(self.env.rfp.get_ppas().items()):
+                cap = ppa.parameters.get('capacity', 0)
+                if ppa.parameters.get("consumes") == 'wind':
+                    simulation['available_power'] += self.env.wind_mapper(simulation['wind']) * cap
+                elif ppa.parameters.get("consumes") == 'solar':
+                    simulation['available_power'] += self.env.solar_mapper(simulation['solar']) * cap
+                else:
+                    simulation['available_power'] += cap # Assumes full availability of non-variable PPAs.
+            simulation['available_power'] = np.clip(simulation['available_power'], 0, gcp_cap)
+            # simulation['wind']            = self.env.wind_mapper(simulation['wind']) * self.env.wind_capacity
+            # simulation['solar']           = self.env.solar_mapper(simulation['solar']) * self.env.solar_capacity
+            # simulation['available_power'] = np.clip(simulation['wind'] + simulation['solar'] + self.env.get_baseload_ppa_power(),0,gcp_cap)
         hourly_need = 0
         for name, contract in self.env.rfp.get_contracts().items():
             is_spot_contract = bool(contract.parameters.get("spot_contract", 0))
@@ -223,6 +235,7 @@ class DeterministicHA(HierarchicalAgent):
         strike_prices = np.zeros(n_sims)
         if self.documentation:
             fig, ax = plt.subplots(figsize=(12,10))
+            max_x = 0
             ax.set_ylabel(r"€/MWh$_e$")
             ax.set_xlabel(r"t/NH$_3$")
         for sim_ix, simulation in enumerate(year_simulations):
@@ -257,16 +270,20 @@ class DeterministicHA(HierarchicalAgent):
                             strike_price = max(strike_price, _sorted.iloc[strike_idx]['price'])
             strike_prices[sim_ix] = strike_price
             if self.documentation:
-                lbl1 = "Simulated Weighted Price-Duration Curve" if sim_ix==0 else ""
-                lbl2 = "Ammonia Strike Price" if sim_ix==0 else ""
+                lbl1 = "Projected Production-Weighted Price-Duration Curves" if sim_ix==0 else ""
+                lbl2 = "Internal Strike Price Estimates" if sim_ix==0 else ""
                 ax.plot(_sorted['cumulative_prod'], _sorted['price'], color='black', label=lbl1, alpha=0.7)
                 ax.axhline(y=strike_prices[sim_ix], label=lbl2, color='blue', linestyle='--', alpha=0.7)
+                max_x = max(max_x, _sorted['cumulative_prod'].values[-1])
         if self.documentation:
+            ax.set_xlim(0, max_x)
+            ax.axhline(y=np.mean(strike_prices), label=lbl2, color='blue', linestyle='--', lw=3, alpha=1)
             ax.axvline(x=target_volume_current['yearly'], label="Missing Contracted Ammonia Production", color='red', linestyle='--')
-            ax.legend() 
-            plt.savefig(f"documentation/heuristic_agent/strike_price_visulization_{str(time.date())}")
+            ax.legend()
+            ax.set_title(f"Estimate on {str(time.date())}")
+            plt.savefig(f"documentation/heuristic_agent/strike_price_visualization/{str(time.date())}")
             plt.close()
-
+        
         # Dependent on metric, return an estimate of strike price:
         sp = self._get_metric(strike_prices, metric=metric) * self.electricity_consumption['ammonia']
         if isinstance(sp, np.ndarray): # The lowest possible internal value of ammonia is the spot value (not completely true with storage limits, but good enough)
@@ -344,7 +361,7 @@ class DeterministicHA(HierarchicalAgent):
             self._calculate_hourly_ammonia_target(obs, time)
         else:
             if time.day % 15 == 1 and self.guideline == 'production_value': # We do not expect big changes in strike price throughout the year - update two times a month.
-                self.ammonia_strike_price = self._estimate_strike_price(obs=obs, time=time, info=info, n_sims=self.n_sims, metric='mean')
+                self.ammonia_strike_price = self._estimate_strike_price(obs=obs, time=time, info=info, n_sims=self.n_sims, metric=self.isp_metric)
 
         actions = self._solve_hourly_decisions(obs=obs, time=time, info=info) # Day-ahead solving
 
@@ -499,33 +516,19 @@ class RecourseAgent(StochasticHA):
         
         return data
 
-    def _bid_and_clear_dayahead(self, obs, k, time:pd.Timestamp, info:dict):
-        data = self._create_data_dict_for_bidding(obs, k, time)
-
-        if k == 0:
-            self.da_bid_model.fixed_horizon = 0
-            self.da_bid_model.initialize_model()
-        if k == 1:
-            self.da_bid_model.fixed_horizon = 12
-            self.da_bid_model.initialize_model()
+    def _resolve_DA_volumes(self, newly_realized_prices, data):
+        desired_volumes = self.da_bid_model.get_da_volumes() # List of lists
+        accepted_volumes = []
+        for t in range(self.decision_horizon):
+            price_volume_pairs = [[data[None]["electricity_price"][(s,t+self.da_bid_model.fixed_horizon)], desired_volumes[s][t]] for s in self.da_bid_model.inst.S]
+            sorted_bids = np.asarray(sorted(price_volume_pairs)) # Sorts ascending by first index (price)
+            sorted_prices = sorted_bids[:,0]
+            sorted_volumes = sorted_bids[:,1]
+            accepted_volume = sorted_volumes[min(len(sorted_volumes)-1,sum(sorted_prices<newly_realized_prices[t]))]
+            accepted_volumes.append(accepted_volume)
         
-        self.da_bid_model.build_concrete_instance(data=data)
-        self.da_bid_model.run(verbose=False)
-
-        # * Here we clear the DA market:
-        # If it is the first day, we only get 24 DA volumes, otherwise 36:
-        newly_realized_prices = list(self.env.realized_prices)[12:36]
-        if self.da_model_type == "recourse DA":
-            desired_volumes = self.da_bid_model.get_da_volumes() # List of lists
-            accepted_volumes = []
-            for t in range(self.decision_horizon):
-                price_volume_pairs = [[data[None]["electricity_price"][(s,t+self.da_bid_model.fixed_horizon)], desired_volumes[s][t]] for s in self.da_bid_model.inst.S]
-                sorted_bids = np.asarray(sorted(price_volume_pairs)) # Sorts ascending by first index (price)
-                sorted_prices = sorted_bids[:,0]
-                sorted_volumes = sorted_bids[:,1]
-                accepted_volume = sorted_volumes[min(len(sorted_volumes)-1,sum(sorted_prices<newly_realized_prices[t]))]
-                accepted_volumes.append(accepted_volume)
-            if self.documentation:
+        if self.documentation:
+            if False:
                 fig, ax = plt.subplots(figsize=(16,12))
                 plt.title(f"Bid, realized price, and resulting Day-Ahead Power")
                 min_price, max_price = 100, 0
@@ -558,6 +561,71 @@ class RecourseAgent(StochasticHA):
                 plt.legend()
                 plt.savefig(f'documentation/heuristic_agent/recourseDA_bidding_agent.png')
                 plt.close()
+
+            ISP = self.ammonia_strike_price / self.electricity_consumption["ammonia"]
+            fig, axs = plt.subplots(4, 6, figsize=(16,12), sharex=True, sharey=True)
+            plt.suptitle(f"LP-Integrated Bidding Strategy", fontweight="bold")
+            axs = axs.flatten()
+            max_v = 0
+            for t in range(self.decision_horizon):
+                ax = axs[t]
+                rp = newly_realized_prices[t]
+                vol = accepted_volumes[t]
+                price_volume_pairs = [[data[None]["electricity_price"][(s,t+self.da_bid_model.fixed_horizon)], desired_volumes[s][t]] for s in self.da_bid_model.inst.S]
+                sorted_bids = np.asarray(sorted(price_volume_pairs)) # Sorts ascending by first index (price)
+                buy_profile = [(bid[0], bid[1]) for bid in sorted_bids if bid[1] > 0]
+                if len(buy_profile) == 0:
+                    buy_profile = [(-500,0), (-500,0)]
+                sell_profile = [(bid[0], bid[1]) for bid in sorted_bids if bid[1] < 0]
+                if len(sell_profile) == 0:
+                    buy_profile.append((4000,buy_profile[-1][1]))
+                    sell_profile = [(4000,0), (4000,0)]
+                sell_profile.insert(0, (buy_profile[-1][0], sell_profile[0][1]))
+                sell_profile.insert(0, (buy_profile[-1][0], 0))
+                sell_profile.append((4000,sell_profile[-1][1]))
+                sell_profile = np.asarray(sell_profile)
+                buy_profile.insert(0, (-500, buy_profile[0][1]))
+                buy_profile.append((buy_profile[-1][0], 0))                
+                buy_profile = np.asarray(buy_profile)
+
+                max_v = max(max_v, np.max(-sell_profile[:,1]), np.max(buy_profile[:,1]))
+                ax.set_title(f"{t}:00-{t+1}:00", fontweight="normal")
+                ax.step(-sell_profile[:,1][::-1], sell_profile[:,0][::-1], label="Selling curve", color="orange", lw=5, alpha=0.5)
+                ax.step(buy_profile[:,1][::-1], buy_profile[:,0][::-1], label="Buying curve", color="blue", lw=5, alpha=0.5)
+                ax.axhline(rp, color="red", linestyle="--", label="DA market clearing", lw=2)
+                ax.scatter([np.abs(vol)], [rp], color="black", marker='x', s=100, label="Power traded")
+                ax.set_ylim(0,180)
+                ax.set_xlabel("Day-ahead volume (MW)", fontweight="normal")
+                ax.set_ylabel("€/MWh", fontweight="normal")
+                ax.grid(True)
+            ax.set_xlim(0, max_v*1.05)
+            ax.axhline(4000, color="purple", linestyle="dashdot", label=f"ISP={ISP}", lw=2)
+            hl, lb = ax.get_legend_handles_labels()
+            fig.legend(handles=hl, labels=lb, bbox_to_anchor=(0.5, 0.07), ncol=5, loc='upper center')
+            fig.tight_layout(rect=[0,0.05,1,1])
+            plt.savefig(f'documentation/heuristic_agent/recourseDA_bidding_agent_hourly.png')
+            plt.close()
+        
+        return accepted_volumes
+
+    def _bid_and_clear_dayahead(self, obs, k, time:pd.Timestamp, info:dict):
+        data = self._create_data_dict_for_bidding(obs, k, time)
+
+        if k == 0:
+            self.da_bid_model.fixed_horizon = 0
+            self.da_bid_model.initialize_model()
+        if k == 1:
+            self.da_bid_model.fixed_horizon = 12
+            self.da_bid_model.initialize_model()
+        
+        self.da_bid_model.build_concrete_instance(data=data)
+        self.da_bid_model.run(verbose=False)
+
+        # * Here we clear the DA market:
+        # If it is the first day, we only get 24 DA volumes, otherwise 36:
+        newly_realized_prices = list(self.env.realized_prices)[12:36]
+        if self.da_model_type == "recourse DA":
+            accepted_volumes = self._resolve_DA_volumes(newly_realized_prices, data)
         else:
             accepted_volumes = self.da_bid_model.get_da_volumes() #
         
@@ -653,12 +721,13 @@ class StrikePriceBiddingAgent(RecourseAgent):
         self.logbook['ammonia_strike_price_list'].append(self.ammonia_strike_price_list)
 
     def _bid_and_clear_dayahead(self, obs, k, time:pd.Timestamp, info:dict):
-        ppa_power = np.sum(obs["context"]["ppas"] * self.env.ppa_context_space.high, axis=1)[12:]
-        T = ppa_power.shape[0]
         if self.n_strike_prices == 1:
             strike_prices = [self.ammonia_strike_price]
         else:
             strike_prices = self.ammonia_strike_price_list
+        ISP = np.mean(strike_prices)/self.electricity_consumption["ammonia"]
+        ppa_power = np.sum(obs["context"]["ppas"] * self.env.ppa_context_space.high, axis=1)[12:]
+        T = ppa_power.shape[0]
         prices = np.concatenate(([-500], np.sort(strike_prices)/self.electricity_consumption["ammonia"])) # We sell all if it is above our max estimated strike price. We buy all if it is below.
 
         def _interpolate_volumes(t):
@@ -674,22 +743,28 @@ class StrikePriceBiddingAgent(RecourseAgent):
         # the volumes are limited so we cannot sell more than we have from our PPA or buy more than we have available capacity at our GCP: 
         accepted_volumes = np.asarray([volumes[t, realized_idxs[t]] for t in range(T)]) # Positive is buy, negative is sell.
         
-        if self.documentation:
-            t=15
+        if self.documentation and self.n_strike_prices == 1:
+            t=16 # Example time index
             rp = real_prices[t]
-            plt.title(f"Bid, realized price, and resulting Day-Ahead Power ({t}:00)")
-            plt.step(list(prices) + [4000], [volumes[t][0]] + list(volumes[t]), label="Bidding curve")
-            plt.axvline(rp, color="red", linestyle="--", label="Cleared Price")
-            plt.axhline(accepted_volumes[t], color="green", linestyle="-.", label="Power Bought")
-            plt.xlim(min(60,rp*0.9, prices[1]*0.8),max(120, rp*1.1, prices[-1]*1.2))
-            plt.ylabel("Day ahead bid buy (MW)")
-            plt.xlabel("€/MWh")
+            vol = accepted_volumes[t]
+            buy_profile = np.asarray([(ISP,0), (ISP,max(volumes[t])), (-500, max(volumes[t]))])
+            sell_profile = np.asarray([(ISP+0.01,0), (ISP+0.01,-min(volumes[t])), (4000, -min(volumes[t]))])
+
+            fig, ax = plt.subplots(figsize=(12,8))
+            plt.title(f"Internal Strike Price Bidding Strategy", fontweight="bold")
+            plt.step(sell_profile[:,1], sell_profile[:,0], label="Selling curve", color="orange", lw=5, alpha=0.5)
+            plt.step(buy_profile[:,1], buy_profile[:,0], label="Buying curve", color="blue", lw=5, alpha=0.5)
+            plt.axhline(rp, color="red", linestyle="--", label="DA market clearing", lw=2)
+            plt.scatter([np.abs(vol)], [rp], color="black", marker='x', s=50, label="Power bought" if vol>0 else "Power Sold")
+            plt.axhline(ISP, color="purple", linestyle="dashdot", label="ISP", lw=2)
+            plt.ylim(0,180)
+            plt.xlim(0)
+            plt.xlabel("Day-ahead volume (MW)", fontweight="bold")
+            plt.ylabel("€/MWh", fontweight="bold")
             plt.grid(True)
             plt.legend()
             plt.savefig('documentation/heuristic_agent/sp_bidding_agent.png')
             plt.close()
-
-        self.previous_da_decisions = np.asarray(accepted_volumes[-12:])
 
         return accepted_volumes, real_prices
 
@@ -727,7 +802,7 @@ class BiddingCurveAgent(RecourseAgent):
                  n_features=3,
                  n_price_domains=1,
                  domain_prices=[],
-                 price_steps=30, # Max 200
+                 price_steps=25, # Max 25 in OMIE
                  mode="train",
                  no_train=False,
                  **kwargs):
@@ -828,6 +903,7 @@ class BiddingCurveAgent(RecourseAgent):
                 Warning(f"Could not get actions.\nTime: {time}.\nState at termination: {obs['state']}.")
 
     def _bid_and_clear_dayahead(self, obs, k, time:pd.Timestamp, info:dict):
+        ISP = self.ammonia_strike_price/self.electricity_consumption["ammonia"]
         # 1. Get DA cleared power using bidding strategy from self.weights
         feature_array, ppa_power, real_prices = self._get_feature_set(obs)
         T = feature_array.shape[0]
@@ -838,39 +914,101 @@ class BiddingCurveAgent(RecourseAgent):
         slopes = np.asarray([[self.weights[_pd, -1, get_hour_of_day(t)]
                                 for t in range(T)]
                                 for _pd in range(self.n_price_domains)])
-        prices = np.concatenate(([-500], np.linspace(self.min_seen_price,self.max_seen_price,self.price_steps-2), [4000]))
+        prices = list(np.concatenate(([4000], np.linspace(self.max_seen_price,self.min_seen_price,self.price_steps-(2+len(self.domain_prices)*2)), [-500])))
+        for p in self.domain_prices:
+            prices.insert(sum(np.asarray(prices)>p), p+0.5)
+            prices.insert(sum(np.asarray(prices)>p), p-0.5)
         # Ensure that we cannot sell more power than we have available from our PPAs,
         # Ensure that we cannot buy more power than our grid connection capacity minus our PPA power.
-        volumes = np.asarray([[np.clip(
-                        intercepts[sum(self.domain_prices < price),t] + slopes[sum(self.domain_prices < price),t] * price,
-                        a_min=-ppa_power[t], a_max=(self.gcp_cap - ppa_power[t])*self.allow_spot_buy)
-                    for price in prices] for t in range(T)])
-        realized_idxs = np.asarray([sum(prices<real_prices[t])-1 for t in range(T)])
-        # We now calculate the accepted volumes for the day ahead market based on the bid curves
-        accepted_volumes = np.asarray([volumes[t, realized_idxs[t]] for t in range(T)]) # Positive is buy, negative is sell.
+        buy_volumes = {}
+        sell_volumes = {}
+        for t in range(T):
+            buy_volumes[t] = {}
+            sell_volumes[t] = {}
+            for price in prices:
+                desired_volume = np.clip(intercepts[sum(self.domain_prices < price),t] + slopes[sum(self.domain_prices < price),t] * price,
+                                         a_min=-ppa_power[t], a_max=(self.gcp_cap - ppa_power[t])*self.allow_spot_buy)
+                if desired_volume >= 0:
+                    buy_volumes[t][price] = desired_volume
+                else:
+                    sell_volumes[t][price] = desired_volume
+        
+        buy_cutoff_price = [prices[sum(prices > real_prices[t])-1] for t in range(T)]
+        sell_cutoff_price = [prices[sum(prices > real_prices[t])] for t in range(T)]
+        power_bought = [buy_volumes[t].get(buy_cutoff_price[t], 0) for t in range(T)]
+        power_sold = [sell_volumes[t].get(sell_cutoff_price[t], 0) for t in range(T)]
+        power_traded = np.asarray(power_bought) + np.asarray(power_sold)
 
         if self.documentation:
-            linestyles = ['-', '--', '-.', ':']
-            for t in range(T):
+            linestyles = ['--', '-.', ':']
+            t=16
+            rp = real_prices[t]
+            vol = power_traded[t]
+            buy_profile = list(buy_volumes[t].items())
+            buy_profile.insert(0, (buy_profile[0][0], 0))
+            buy_profile = np.asarray(buy_profile)
+            sell_profile = list(sell_volumes[t].items())
+            sell_profile.append((sell_profile[-1][0], 0))
+            sell_profile = np.asarray(sell_profile)
+
+            fig, ax = plt.subplots(figsize=(12,8))
+            plt.title(f"Decision Rule Bidding Strategy ({self.n_price_domains} domains)", fontweight="bold")
+            plt.step(-sell_profile[:,1][::-1], sell_profile[:,0][::-1], label="Selling curve", color="orange", lw=5, alpha=0.5)
+            plt.step(buy_profile[:,1], buy_profile[:,0], label="Buying curve", color="blue", lw=5, alpha=0.5)
+            plt.axhline(rp, color="red", linestyle="--", label="DA market clearing", lw=2)
+            plt.scatter([np.abs(vol)], [rp], color="black", marker='x', s=50, label="Power bought" if vol>0 else "Power Sold")
+            plt.axhline(ISP, color="purple", linestyle="dashdot", label="ISP", lw=2)
+            for j in range(len(self.domain_prices)):
+                plt.axhline(self.domain_prices[j], color="black", alpha=0.3, linestyle=linestyles[j], )#label=f"Boundary Price {j}:{j+1}")
+
+            plt.axvline(0, color='grey')
+            plt.ylim(0,180)
+            plt.xlim(0)
+            plt.xlabel("Day-ahead volume (MW)", fontweight="bold")
+            plt.ylabel("€/MWh", fontweight="bold")
+            plt.grid(True)
+            plt.legend()
+            plt.savefig(f'documentation/heuristic_agent/dr_bidding_agent_{self.n_price_domains}_one_hour.png')
+            plt.close()
+            
+            ts=[14,15,16,17]
+            fig, axs = plt.subplots(2,2,figsize=(14,10), sharex=True, sharey=True)
+            plt.suptitle(f"Decision Rule Bidding Strategy ({self.n_price_domains} domains)", fontweight="bold")
+            axs = axs.flatten()
+            max_v = 0
+            for ix, ax in enumerate(axs):
+                t = ts[ix]
                 rp = real_prices[t]
-                plt.title(f"Bid, realized price, and resulting Day-Ahead Power ({t}:00)")
-                plt.step(list(volumes[t]), list(prices), label="Bidding curve", color="blue")
-                for ix in range(len(self.domain_prices)):
-                    plt.axhline(self.domain_prices[ix], color="black", alpha=0.3, linestyle=linestyles[ix], label=f"Price Domain {ix+1} Border")
-                plt.axhline(rp, color="red", linestyle="--", label="Cleared Price")
-                plt.axvline(accepted_volumes[t], color="green", linestyle="-.", label="Power Bought")
-                plt.ylim(self.min_seen_price, self.max_seen_price)
-                plt.xlim(min(volumes[t]*1.1), max(volumes[t]*1.1))
-                plt.ylabel("Price [€/MWh]")
-                plt.xlabel("Volume - Buying [MW]")
-                plt.grid(True)
-                plt.legend()
-                plt.savefig(f'documentation/ldr_agent/D{self.n_price_domains}_hour{t}.png')
-                plt.close()
+                vol = power_traded[t]
+                buy_profile = list(buy_volumes[t].items())
+                buy_profile.insert(0, (buy_profile[0][0], 0))
+                buy_profile = np.asarray(buy_profile)
+                sell_profile = list(sell_volumes[t].items())
+                sell_profile.append((sell_profile[-1][0], 0))
+                sell_profile = np.asarray(sell_profile)
+                max_v = max(max_v, np.max(-sell_profile[:,1]), np.max(buy_profile[:,1]))
+                ax.set_title(f"{t}:00-{t+1}:00", fontweight="normal")
+                ax.step(-sell_profile[:,1][::-1], sell_profile[:,0][::-1], label="Selling curve", color="orange", lw=5, alpha=0.5)
+                ax.step(buy_profile[:,1], buy_profile[:,0], label="Buying curve", color="blue", lw=5, alpha=0.5)
+                ax.axhline(rp, color="red", linestyle="--", label="DA market clearing", lw=2)
+                ax.scatter([np.abs(vol)], [rp], color="black", marker='x', s=50, label="Power traded")
+                ax.axhline(ISP, color="purple", linestyle="dashdot", label="ISP", lw=2)
+                for j in range(len(self.domain_prices)):
+                    ax.axhline(self.domain_prices[j], color="black", alpha=0.3, linestyle=linestyles[j], )#label=f"Boundary Price {j}:{j+1}")
 
-        self.previous_da_decisions = np.asarray(accepted_volumes[-12:])
+                ax.axvline(0, color='grey')
+                ax.set_ylim(0,180)
+                ax.set_xlabel("Day-ahead volume (MW)", fontweight="normal")
+                ax.set_ylabel("€/MWh", fontweight="normal")
+                ax.grid(True)
+            ax.set_xlim(0, max_v*1.05)
+            hl, lb = ax.get_legend_handles_labels()
+            fig.legend(handles=hl, labels=lb, bbox_to_anchor=(0.5, 0.07), ncol=5, loc='upper center')
+            fig.tight_layout(rect=[0,0.05,1,1])
+            plt.savefig(f'documentation/heuristic_agent/dr_bidding_agent_{self.n_price_domains}.png')
+            plt.close()
 
-        return accepted_volumes, real_prices
+        return power_traded, real_prices
 
     def _solve_hourly_decisions(self, obs, k, time:pd.Timestamp, info:dict):
         if self.weights is None or type(self.env) == RFPYearEnv:

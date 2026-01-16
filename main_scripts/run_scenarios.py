@@ -17,20 +17,23 @@ def main():
 
     # guideline = "hourly_target" # Promote a fixed production flow for all hours.
     guideline = "production_value" # Reward production of ammonia based on estimating internal value of ammonia.
+    isp_metric = 'max'
 
-    n_episodes = 50
+    n_episodes = 20
 
-    scenarios = ["default", "80percent_ammonia", "70percent_ammonia", "60percent_ammonia", "50percent_ammonia", "40percent_ammonia", "no_solar_power", "high_RE_level"]
-    scenarios = ["high_RE_level"]
-    scenarios = ["40percent_ammonia", "no_solar_power", "high_RE_level"]
+    # scenarios = ["default", "80percent_ammonia", "70percent_ammonia", "60percent_ammonia", "50percent_ammonia", "40percent_ammonia", "no_solar_power", "high_RE_level"]
+    # scenarios = ["80percent_ammonia", "70percent_ammonia", "60percent_ammonia", "40percent_ammonia"]
+    # scenarios = ["base_case_no_spot", "no_solar_power", "high_RE_level"]
+    scenarios = ["50percent_ammonia"]
+    # scenarios = ["30percent_ammonia", "20percent_ammonia", ]
     for scenario in scenarios:
         env = get_env(RFPEnv, allow_spot_buy=allow_spot_buy, balancing_market=False, verbose=True, load_data=True, scenario_name=scenario)
         
-        agent = DeterministicHA(env=env, solver=solver, planning_horizon=planning_horizon, guideline=guideline)
+        agent = DeterministicHA(env=env, solver=solver, planning_horizon=planning_horizon, guideline=guideline, isp_metric=isp_metric)
         
-        experiment_name = "_".join(["scenario", scenario, str(agent), guideline, "ph", str(planning_horizon), "spot", str(allow_spot_buy)])
+        experiment_name = "_".join(["scenario", scenario, str(agent), guideline, "ph", str(planning_horizon), "spot", str(allow_spot_buy), "ispmetric", isp_metric])
         print("Start experiment: ", experiment_name)
-        stats, trajectories = train(env, agent, experiment_name=experiment_name, num_episodes=n_episodes, verbose=True, continue_trajectories_and_stats=True, save_every=10)
+        stats, trajectories = train(env, agent, experiment_name=experiment_name, num_episodes=n_episodes, verbose=True, continue_trajectories_and_stats=False)
         agent.close()
         print("Experiment done")
 

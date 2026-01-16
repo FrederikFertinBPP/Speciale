@@ -176,6 +176,8 @@ class HourlyDeterministicLPModel:
             def conversion_rule(m, t):
                 return b.out_flow[t] == b.rate * b.in_flow[t]
             b.conversion_constraint = pyo.Constraint(self.model.T, rule=conversion_rule)
+            # if self.guideline == 'hourly_target' and b._name == "Haber Bosch Plant":
+            #     b.hourly_slack = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.capacity))
         self.model.linkBlocks = pyo.Block(self.model.links, rule=linkBlock_rule)
 
         def offtakerBlock_rule(b, offt): # Create a block for each offtaker to handle consumption
@@ -420,13 +422,15 @@ class HourlyDeterministicLPModel:
             storage_value = sum(b.soc[self.decision_horizon-1] * inst.storage_value[name] for name, b in inst.storageBlocks.items())
             contract_value = sum(b.contract_status[self.decision_horizon-1] * inst.contract_value[name] for name, b in inst.contractBlocks.items() if b.is_spot_contract == False)
             return storage_value + contract_value
-
+        
         def objective_rule(inst):
             obj = cashflow_rule(inst)
             if self.guideline == 'production_value':
                 obj += production_value_rule(inst)
             if self.objective_logic == 'value_maximization':
                 obj += state_value_rule(inst)
+            # if self.guideline == 'hourly_target':
+            #     obj -= 1e6 * sum(inst.linkBlocks["Haber Bosch Plant"].hourly_slack[t] for t in inst.T) # Penalize slack variables heavily.
             return obj
 
         self.inst.objective = pyo.Objective(rule=objective_rule, sense=pyo.maximize)
@@ -804,7 +808,7 @@ class DecisionRuleModel(HourlyRecourseModel):
 
         if hasattr(self.model, 'dayaheadBlocks'):
             self.model.del_component('dayaheadBlocks')
-        
+
         def dayaheadBlock_rule(b, da):
             dayahead        = self.rfp.get_component(da)
             b._name         = da
@@ -1239,7 +1243,6 @@ class StochasticRecourseModel(HourlyRecourseModel):
 
         if self.model_type == "recourse DA":
             # & Ensure that the buy volumes are non-increasing with price.
-            # * Implement non-decreasing (with price) day-ahead bids here.
             # Precompute sorted scenario order for each time t
             sorted_scenarios = { 
                 t: [s for price, s in sorted(

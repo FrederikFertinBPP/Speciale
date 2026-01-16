@@ -27,7 +27,8 @@ def get_env(env_class:gym.Env,
     forecaster.t_init = forecaster.test_data.index[0]
 
     ### Scenario specification: Could be predefined in excel file.
-    rfp.get_contract('Ammonia1').parameters['volume'] = rfp.get_component("Haber Bosch Plant").parameters.get('capacity') * 8760 / (2 if allow_spot_buy else 5)  # 50% capacity contracted
+    # if allow_spot_buy:
+    #     rfp.get_contract('Ammonia1').parameters['volume'] = rfp.get_component("Haber Bosch Plant").parameters.get('capacity') * 8760 / (2 if allow_spot_buy else 5)  # 50% capacity contracted
 
     env = env_class(rfp=rfp, forecaster=forecaster, decision_horizon=24,
                     allow_spot_buy = allow_spot_buy, verbose=verbose,

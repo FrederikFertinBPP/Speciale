@@ -30,7 +30,7 @@ def main():
     print("Start experiment: ", experiment_name)
     
     stats, trajectories = train(env, agent, experiment_name=experiment_name, num_episodes=n_episodes,
-                                verbose=True, continue_trajectories_and_stats=True, starting_episode=30, save_every=10)
+                                verbose=True, save_every=5)
     agent.close()
     print("Experiment done")
 

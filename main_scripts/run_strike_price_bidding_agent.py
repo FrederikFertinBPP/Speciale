@@ -28,7 +28,7 @@ def main():
                             planning_horizon=planning_horizon,
                             guideline=guideline,
                             n_strike_prices=n_strike_prices,
-                            n_sims=5,
+                            n_sims=1,
                             n_scenarios=n_scenarios,
                             )
     

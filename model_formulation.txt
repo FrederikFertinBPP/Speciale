@@ -1,0 +1,259 @@
+The operational space of the RFP is defined by a set of constraints governing the state-of-charge (SOC) of storages, capacities of units, and conversion efficiencies. The internal dynamics of the plant are assumed to be known without uncertainties. The following section describes the deterministic implementation of the plant dynamics. The plant model is constructed around a nodal formulation, where each identified node in the plant must be constantly in balance in terms of in- and outflows. 
+
+\tab The actual implementation of the LP model of a Renewable Fuel Plant follows a modular approach using Pyomo's native Block structure, where the model consist of a set of blocks, which each contain sub-blocks. The sub-blocks then contains parameters (some mutable), variables, and some associated sub-block delimited constraints. We define $T$ as the time horizon of the problem considered and $t = \{0, 1, \dots, T-1\}$ as the model time steps. We also define sets which each represent a model block:
+
+\begin{itemize}[noitemsep]
+    \item \( K \): Set of energy carriers
+    \item \( S \): Set of storages
+    \item \( P \): Set of PPAs
+    \item \( L \): Set of conversion units
+    \item \( O \): Set of offtake units
+    \item \( C \): Set of contracts
+\end{itemize}
+
+\subsubsection{Carrier block}
+The carrier block contains the nodes of the plant. The set of energy carriers is constructed to be equivalent to the modelled nodes of the RFP. The considered carriers are grid electricity, plant electricity, hydrogen, and ammonia. However, this can be generalized to more or less carriers dependent on the setup of the RFP. E.g., if we also wanted to investigate the sourcing of water for electrolysis, we could include a water carrier sub-block, which would then require us to provide an explicit source of water. Sub-blocks are denoted by \(k \in K \).
+
+\textbf{Parameters}
+\begin{itemize}
+    \item \( unit_{k}\): Unit used to represent flow and capacity values for carrier \( k \).
+\end{itemize}
+
+\textbf{Variables} (None)
+
+\textbf{Constraints}
+For each carrier \( k \in K \) and time \( t \in T \), the total inflow must equal the total outflow:
+\begin{align}
+\sum \text{inflows}_{k,t} = \sum \text{outflows}_{k,t} \quad \forall k \in K, \forall t \in T
+\end{align}
+
+Inflow and outflow terms are determined by the components that produce or consume the carrier \( k \), including:
+
+\begin{itemize}
+    \item PPAs, day-ahead markets, conversion units, and storages that produce \( k \) contribute to inflows.
+    \item Conversion units, storages, and offtake units that consume \( k \) contribute to outflows.
+    \item For plant electricity, outflows are separately defined as the electricity consumption by units in the plant.
+\end{itemize}
+
+
+\subsubsection{Storage block}
+The storage block contains all storages of the RFP. Storages included in the case study are hydrogen and ammonia storages, but the storage flexibility could also have been provided by an electricity storage in an alternate plant setup. Storages are characterized by their intertemporality through their SOC, which makes decomposition of large optimization problems more challenging. Sub-blocks are denoted by \( s \in S \).
+
+\textbf{Parameters}
+\begin{itemize}[noitemsep]
+    \item \( \text{carrier}_s \): Energy carrier stored by storage \( s \).
+    \item \( \text{capacity}_s \): Maximum storage capacity for storage \( s \).
+    \item \( \text{ec}_s \): Electricity consumption rate for charging storage \( s \) [MWh/input].
+    \item \( \text{init\_soc}_s \): Initial state of charge.
+\end{itemize}
+
+\textbf{Variables}
+\begin{center}
+    \begin{tabular}{|l|c|c|p{10cm}|}
+    \hline
+    \textbf{Name} & \textbf{lb} & \textbf{ub} & \textbf{Description} \\
+    \hline
+    \( \text{soc}_{s,t} \) & 0 & \( \text{capacity}_s \) & State of charge of storage \( s \) at time \( t \) \\
+    \( \text{in\_flow}_{s,t} \) & 0 & \( \text{capacity}_s \) & Inflow to storage \( s \) at time \( t \) \\
+    \( \text{out\_flow}_{s,t} \) & 0 & \( \text{capacity}_s \) & Outflow from storage \( s \) at time \( t \) \\
+    \( \text{elec\_cons}_{s,t} \) & 0 & \( \text{capacity}_s \cdot \text{ec}_s \) & Electricity consumed for charging storage \( s \) at time \( t \) \\
+    \hline
+    \end{tabular}
+\end{center}
+
+\textbf{Constraints}
+\begin{subequations}\label{eq:storage_constraints}
+    \begin{align}
+    \text{elec\_cons}_{s,t} &= \text{in\_flow}_{s,t} \cdot \text{ec}_s
+    &&\forall s \in S, \forall t \in T \\
+    \text{soc}_{s,0} &= \text{init\_soc}_s + \text{in\_flow}_{s,0} - \text{out\_flow}_{s,0}
+    &&\forall s \in S \\
+    \text{soc}_{s,t} &= \text{soc}_{s,t-1} + \text{in\_flow}_{s,t} - \text{out\_flow}_{s,t}
+    &&\forall s \in S, \forall t > 0
+    \end{align}
+\end{subequations}
+
+\subsubsection{PPA block}
+The PPA block contains the power sourcing stack of PPAs which are available for the RFP. Sub-blocks are denoted by \( p \in P \).
+
+\textbf{Parameters}
+\begin{itemize}[noitemsep]
+    \item \( \text{capacity}_p \): Maximum production capacity of PPA \( p \) [MW].
+    \item \( \text{cf}_{p,t} \): Capacity factor at time \( t \) [\%].
+    \item \( \text{price}_p \): Price of PPA power [\euro/MWh].
+\end{itemize}
+
+\textbf{Variables}
+\begin{center}
+    \begin{tabular}{|l|c|c|p{8cm}|}
+    \hline
+    \textbf{Name} & \textbf{lb} & \textbf{ub} & \textbf{Description} \\
+    \hline
+    \( \text{out\_flow}_{p,t} \) & 0 & \( \text{capacity}_p \) & Output flow from supplier \( p \) at time \( t \) \\
+    \hline
+    \end{tabular}
+\end{center}
+
+\textbf{Constraints}
+\begin{align}\label{eq:supply_constraints}
+\text{out\_flow}_{p,t} &= \text{cf}_{p,t} \cdot \text{capacity}_p &&\forall p \in P, \forall t \in T
+\end{align}
+
+The variable $\text{out\_flow}_{p,t}$ can be removed and included in the model as a parameter if the PPA necessitates equality as indicated in this constraint.
+
+\subsubsection{Day-ahead block}
+The day-ahead block contains the singleton of day ahead markets that the RFP participates in. The outflow from the day-ahead block is the amount of power bought from the day-ahead market. If the outflow is negative, we are selling power from our PPAs to the market.
+
+\textbf{Parameters}
+\begin{itemize}[noitemsep]
+    \item \( \text{capacity} \): Maximum trade capacity in the market [MW].
+\end{itemize}
+
+\textbf{Variables}
+\begin{center}
+    \begin{tabular}{|l|c|c|p{8cm}|}
+    \hline
+    \textbf{Name} & \textbf{lb} & \textbf{ub} & \textbf{Description} \\
+    \hline
+    \( \text{out\_flow}^{\text{market}}_{t} \) & \( -\text{capacity} \) & \( \text{capacity} \) & Sum of power bought at time \( t \), ub is 0 if we do not allow spot purchase of power. \\
+    \( \text{da}_{t} \) & \( -\text{capacity} \) & \( \text{capacity} \) & Power bought from day-ahead market at time \( t \), ub is 0 if we do not allow spot purchase of power. \\
+    \hline
+    \end{tabular}
+\end{center}
+
+\textbf{Constraints}
+\begin{align}\label{eq:da_outflow_constraint}
+\text{out\_flow}_{t} &= \text{da}_{t} &&\forall t \in T
+\end{align}
+The definition of a day-ahead variable is redundant in the current formulation, but makes the formulation more flexible when introducing additional power streams from the intra-day market.
+
+\subsubsection{Conversion unit block}
+The conversion unit block contains physical units converting one carrier to another. The types of conversion units included in the case study are: Grid connection (transformer), electrolyzer, and ammonia synthesizer (Haber-Bosch process). Sub-blocks are denoted by \( l \in L \).
+
+\textbf{Parameters}
+\begin{itemize}[noitemsep]
+    \item \( \text{rate}_l \): Conversion rate of conversion unit \( l \) [output/input].
+    \item \( \text{capacity}_l \): Maximum capacity [output/h].
+    \item \( \text{ec}_l \): Electricity consumption rate [MWh/output].
+    \item \( \text{carrier\_in}_l \): The input carrier of conversion unit \(l\).
+    \item \( \text{carrier\_out}_l \): The output carrier of conversion unit \(l\).
+\end{itemize}
+
+\textbf{Variables}
+\begin{center}
+    \begin{tabular}{|l|c|c|p{8cm}|}
+    \hline
+    \textbf{Name} & \textbf{lb} & \textbf{ub} & \textbf{Description} \\
+    \hline
+    \( \text{in\_flow}_{l,t} \) & 0 & \( \frac{\text{capacity}_l}{\text{rate}_l} \) & Input flow to conversion unit \( l \) at time \( t \) \\
+    \( \text{out\_flow}_{l,t} \) & 0 & \( \text{capacity}_l \) & Output flow from conversion unit \( l \) at time \( t \) \\
+    \( \text{elec\_cons}_{l,t} \) & 0 & \( \text{capacity}_l \cdot \text{ec}_l \) & Electricity consumed by conversion unit \( l \) at time \( t \) \\
+    \hline
+    \end{tabular}
+\end{center}
+
+\textbf{Constraints}
+\begin{subequations}\label{eq:conversion_unit_constraints}
+    \begin{align}
+    \text{elec\_cons}_{l,t} &= \text{ec}_l \cdot \text{out\_flow}_{l,t} &&\forall l \in L, \forall t \in T \\
+    \text{out\_flow}_{l,t} &= \text{rate}_l \cdot \text{in\_flow}_{l,t} &&\forall l \in L, \forall t \in T
+    \end{align}    
+\end{subequations}
+
+\subsubsection{Offtake unit block}
+A distinction is made between offtake units and contracts. We here define an offtake unit as a physical offtake object, which carries a product away from the RFP, e.g. a hydrogen pipeline, which can potentially supply several contracts. In the case study we consider to offtake units: A hydrogen pipeline and an ammonia ship. Other potential offtake units could be trucks transporting away the sold fuels. Offtake units have availability schedules, where shipments can be supplied to an offtaker (owner of an offtake contract).
+
+\textbf{Parameters}
+\begin{itemize}[noitemsep]
+    \item \( \text{capacity}_o \): Maximum offtake unit capacity.
+    \item \( \text{carrier}_o \): Energy carrier of offtake unit.
+    \item \( C_o \): Subset of contracts supplied through offtake unit.
+\end{itemize}
+
+\textbf{Variables}
+\begin{center}
+    \begin{tabular}{|l|c|c|p{8cm}|}
+    \hline
+    \textbf{Name} & \textbf{lb} & \textbf{ub} & \textbf{Description} \\
+    \hline
+    \( \text{in\_flow}_{o,t} \) & 0 & \( \text{capacity}_o \) & Inflow to offtake unit \( o \) at time \( t \) \\
+    \hline
+    \end{tabular}
+\end{center}
+
+\textbf{Constraints}
+\begin{align}
+\text{in\_flow}_{o,t} &= \sum_{c \in C_o} \text{shipment}_{c,t} &&\forall o \in O, \forall t \in T
+\end{align}
+
+\subsubsection{Contract block}
+The contract block contains parameters, variables, and constraints related to each individual contract that the RFP is subject to. Sub-blocks are denoted by \(c \in C\). Some general assumptions about the structure of contracts are made: Deadlines and shipments are either hourly, daily, monthly, or yearly, and the contracted volume is a fixed number - not a range. One basic exception to the general contract structure is given to spot contracts - contracts which state that an unspecified amount of fuel can be sold to this contract without deadlines or contracted volumes, but then also sold at a lower price. These contracts do still follow the shipment schedule, which is decided by the available offtake units.
+
+\textbf{Parameters}
+\begin{itemize}[noitemsep]
+    \item \( \text{carrier}_c \): Energy carrier of contract.
+    \item \( \text{price}_c \): Contracted price of product.
+    \item \( \text{penalty}_c \): Penalty for delivery shortfall.
+    \item \( \text{volume}_c \): Contracted volume.
+    \item \( \text{offtake\_unit}_c \): The offtake unit which the contract is supplied through.
+    \item \( \text{target\_frequency}_c \): Frequency of delivery targets. If the frequency is hourly, the constraints are enforced every hour, if it is daily, then it is enforced the last hour of each day, if monthly, then it's the last hour of each month, and if yearly, then it's the last hour of each year.
+    \item \( T^{target}_c \): Set of time stamps with deadlines for contract \( c \).
+    \item \( \text{shipment\_frequency}_c \): Frequency of allowed shipments. Similar frequency implications. The distinction is made between shipments and targets as we can have yearly contracts, where shipments are made throughout the year.
+    \item \( T^{shipment}_{c} \): Set of shipment time stamps for contract \( c \).
+    \item \( \text{init\_status}_c \): Initial contract status.
+\end{itemize}
+
+\textbf{Variables}
+\begin{center}
+    \begin{tabular}{|l|c|c|p{8.5cm}|}
+    \hline
+    \textbf{Name} & \textbf{lb} & \textbf{ub} & \textbf{Description} \\
+    \hline
+    \( \text{shipment}_{c,t} \) & 0 & \( \text{capacity}_{\text{offtake\_unit}(c)} \) & Shipment to contract \( c \) at time \( t \) \\
+    \( \text{status}_{c,t} \) & 0 & \( \text{volume}_c \) & Accumulated delivery to contract \( c \) at time \( t \) \\
+    \( \text{shortfall}_{c,t} \) & 0 & \( \text{volume}_c \) & Shortfall at delivery deadline for contract \( c \) \\
+    \( \text{slack}_{c,t} \) & 0 & \( \text{volume}_c \) & Excess delivery beyond contract volume \( c \) \\
+    \hline
+    \end{tabular}
+\end{center}
+
+\textbf{Constraints}
+\begin{subequations}\label{eq:contract_constraints}
+    \begin{align}
+    \text{shipment}_{c,t} &= 0
+    &&\forall c \in C, \forall t \notin T^{shipment}_{c}\\
+    \text{status}_{c,t} &= \text{shipment}_{c,t}
+    &&\forall c \in C, \forall t-1 \in T^{target}_{c}\\
+    \text{status}_{c,0} &= \text{init\_status}_{c} + \text{shipment}_{c,0}
+    &&\forall c \in C\\
+    \text{status}_{c,t} &= \text{status}_{c,t-1} + \text{shipment}_{c,t}
+    &&\forall c \in C, \forall t>0 \wedge t-1 \notin T^{target}_{c}\\
+    \text{shortfall}_{c,t} - \text{slack}_{c,t} &= 
+    \text{volume}_c - \text{status}_{c,t}
+    &&\forall c \in C, \forall t \in T^{target}_{c}\\
+    \text{shortfall}_{c,t} + \text{slack}_{c,t} &= 0
+    &&\forall c \in C, \forall t \notin T^{target}_{c}
+    \end{align}
+\end{subequations}
+
+These constraints ensure that shipment variables are non-zero only when the offtake unit is available for shipment. The status constraints indicate that the physical shipment is what increments the status of each individual contract, and that the status is reset after each deadline. The contract shortfall is equal to the difference between contracted volume and the contract status at deadline and is zero otherwise.
+
+\subsubsection{Mutable model parameters}
+The problem is not solved for years at a time but on a rolling time horizon. This is motivated by the nature of the problem where the RFP is subject to uncertainties regarding future electricity prices and power production profiles of their renewable PPAs along with the intertemporal nature of storages and contract structures. Following the daily clearing and realization of the electricity day-ahead market we fix our decisions for 24 hours at a time. To carry over information from previous runs to current runs a number of mutable model parameters is identified, which is set with unique values every iteration.
+
+\textbf{Parameters}
+\begin{itemize}[noitemsep]
+    \item \( \text{init\_soc}_s \): Initial state of charge of storage \( s \). This value is part of the current state of the environment.
+    \item \( \text{init\_status}_c \): Initial delivery status of contract \( c \). This value is part of the current state of the environment.
+    \item \( \text{cf}_{p,t} \): Capacity factor of PPA \( p \) at time \( t \). The uncertainty of renewable production is hedged against in the PPA meaning that for the RFP, the available power is deterministic for the next 24 hours, but uncertain on longer time horizons. 
+    \item \( p^{DA}_{t} \): The forecast of the day-ahead electricity price for each hour. The realization is uncertain at the time of decision-making.
+\end{itemize}
+
+\subsubsection{Objective function}
+The long-term objective function of the renewable fuel plant is easily defined as a profit maximization. The income streams subtracted the cost streams. The considered income streams are ammonia sales, hydrogen sales, and electricity sales. The cost streams are contract penalties and electricity procurement.
+\begin{align}
+    \texttt{obj} = \max \sum_{t\in T} \left[ \sum_{c\in C} \left( \text{shipment}_{c,t} \cdot \text{price}_c - \text{shortfall}_{c,t} \cdot \text{penalty}_c \right) - \text{da}_t \cdot p^{DA}_t \right] \label{eq:original_objective}
+\end{align}
+
+The PPA procurement costs are not included in the objective function as they are not a variable decision in the operational model. As discussed earlier, \Cref{eq:original_objective} does not work as is as an objective function when solving the problem with a rolling horizon. E.g., the shipment value would not be known for horizons where there are no shipment possibilities and penalties would not be internalized where there are no deadlines. 
+

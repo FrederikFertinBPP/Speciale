@@ -8,6 +8,28 @@ import pandas as pd
 fields = ('time', 'state', 'action', 'reward')
 Trajectory = namedtuple('Trajectory', fields + ("env_info",))
 
+def set_plotting_style():
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    sns.set_theme("notebook", font_scale=1.5, style="darkgrid")
+    plt.rcParams['font.size'] = 16
+    # set legend fontsize to 14
+    plt.rcParams['legend.fontsize'] = 18
+    # set the font weight of the legend to bold
+    plt.rcParams['legend.title_fontsize'] = 18
+    # set the font size of the x and y labels to 14
+    plt.rcParams['axes.labelsize'] = 18
+    # set the font weight of the x and y labels to bold
+    plt.rcParams['axes.labelweight'] = 'bold'
+    # set the font size of the x and y ticks to 12
+    plt.rcParams['xtick.labelsize'] = 16
+    plt.rcParams['ytick.labelsize'] = 16
+    # set the font size of the title to 16
+    plt.rcParams['axes.titlesize'] = 18
+    # set the font weight of the title to bold
+    plt.rcParams['axes.titleweight'] = 'bold'
+
 class expando(object):
     pass
 
