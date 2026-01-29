@@ -19,22 +19,25 @@ set_plotting_style()
 # experiment_name = "test_DeterministicHA_production_value_ph_96_spot_True"
 # experiment_name = "test_StochasticHA5_production_value_ph_96_spot_True"
 
-experiments = ("test_DeterministicHA_hourly_target_ph_96_spot_True",
-                "test_DeterministicHA_production_value_ph_96_spot_True", 
-                # "test_StochasticHA5_production_value_ph_96_spot_True",
-                "test_RecourseAgent1_production_value_ph_96_spot_True",
-                # "test_RecourseAgent5_production_value_ph_96_spot_True",
-                "test_StrikePriceBiddingAgent1_SP1_production_value_ph_96_spot_True",
-                # "test_StrikePriceBiddingAgent1_SP5_production_value_ph_96_spot_True",
-                "test_BiddingCurveAgent1_D1_ph_96_spot_True",
-                "test_BiddingCurveAgent1_D2_ph_96_spot_True",
-                "test_BiddingCurveAgent1_D3_ph_96_spot_True",
-                "test_RecourseAgent5_DAbidding_production_value_ph_96_spot_True",
-            )
-palette = sns.color_palette("colorblind")
-colors = palette[:len(experiments)]  # Customize as needed
-colors = [palette[0], palette[1], "orange", "pink", "turquoise", "turquoise", "turquoise", palette[2]]
-documentation_dir = "profit_dists"
+""" Base case investigation """
+# experiments = ("test_DeterministicHA_hourly_target_ph_96_spot_True",
+#                 "test_DeterministicHA_production_value_ph_96_spot_True", 
+#                 # "test_StochasticHA5_production_value_ph_96_spot_True",
+#                 "test_RecourseAgent1_production_value_ph_96_spot_True",
+#                 # "test_RecourseAgent5_production_value_ph_96_spot_True",
+#                 "test_StrikePriceBiddingAgent1_SP1_production_value_ph_96_spot_True",
+#                 # "test_StrikePriceBiddingAgent1_SP5_production_value_ph_96_spot_True",
+#                 "test_BiddingCurveAgent1_D1_ph_96_spot_True",
+#                 "test_BiddingCurveAgent1_D2_ph_96_spot_True",
+#                 "test_BiddingCurveAgent1_D3_ph_96_spot_True",
+#                 "test_RecourseAgent5_DAbidding_production_value_ph_96_spot_True",
+#             )
+# palette = sns.color_palette("colorblind")
+# colors = palette[:len(experiments)]  # Customize as needed
+# colors = [palette[0], palette[1], "orange", "pink", "turquoise", "turquoise", "turquoise", palette[2]]
+# documentation_dir = "profit_dists"
+
+""" Planning horizon investigation """
 # experiments = ("planningsensitivity_DeterministicHA_production_value_ph_24_spot_True", # The last 5 scenarios needs to be run
 #                 "planningsensitivity_DeterministicHA_production_value_ph_48_spot_True", # The last 5 scenarios needs to be run
 #                 "planningsensitivity_DeterministicHA_production_value_ph_72_spot_True", # Is probably alright.
@@ -42,6 +45,8 @@ documentation_dir = "profit_dists"
 #                 )
 # colors = 4*['blue']  # Customize as needed
 # documentation_dir = "planning_sensitivity"
+
+""" NH3 volume sensitivity """
 # scenarios = ["20percent_ammonia", "30percent_ammonia", "40percent_ammonia", "50percent_ammonia", "60percent_ammonia", "70percent_ammonia", "80percent_ammonia"]
 # agents = ("DeterministicHA_hourly_target_ph_72_spot_True",
 #             "DeterministicHA_production_value_ph_72_spot_True",
@@ -53,6 +58,8 @@ documentation_dir = "profit_dists"
 # palette = sns.color_palette("colorblind")
 # colors = len(scenarios)*[palette[0]] + len(scenarios)*[palette[1]] + len(scenarios)*[palette[2]] + len(scenarios)*[palette[3]] + len(scenarios)*[palette[4]]  # Customize as needed
 # documentation_dir = "scenario_comparisons"
+
+""" Bidding strategies """
 # experiments = ("test_RecourseAgent1_production_value_ph_96_spot_True",
 #                 "test_StrikePriceBiddingAgent1_SP1_production_value_ph_96_spot_True",
 #                 "test_BiddingCurveAgent1_D1_ph_96_spot_True",
@@ -62,6 +69,17 @@ documentation_dir = "profit_dists"
 #             )
 # colors = ['blue'] + ['green'] + 3*['lightgreen'] + ['orange']  # Customize as needed
 # documentation_dir = "intraday_bidding_strategies"
+
+""" PPA only """
+scenarios = ["base_case_no_spot", "no_solar_power", "high_RE_level"]
+agents = ("DeterministicHA_production_value_ph_72_spot_False",
+            "RecourseAgent1_production_value_ph_72_spot_False",
+            "StrikePriceBiddingAgent1_SP1_production_value_ph_72_spot_False",
+)
+experiments = [f"scenario_{scenario}_{agent}" for scenario in scenarios for agent in agents]
+palette = sns.color_palette("colorblind")
+colors = len(scenarios)*palette[:len(agents)]
+documentation_dir = "ppa_only_results"
 
 exp_ebitda = {}
 VaR_90_ebitda = {}
@@ -74,8 +92,7 @@ exp_percentages = {}
 VaR_90_percentages = {}
 
 results_dict = {}
-
-
+cp_dict = {}
 
 for experiment_name in experiments:
     f = experiment_name.split("_")
@@ -88,6 +105,8 @@ for experiment_name in experiments:
     results = pd.read_csv(f"evaluation_scripts/processed_results/{experiment_name}/trajectory_summary.csv")
     results_dict[name] = results
     # results2 = pd.read_csv(f"evaluation_scripts/processed_results/{experiment_name2}.csv")
+    results_cp = pd.read_csv(f"evaluation_scripts/processed_results/{experiment_name}/capture_price_summary.csv")
+    cp_dict[name] = results_cp
 
     fig, ax = plt.subplots(figsize=(16,12))
     sns.histplot(results["Profit Percentage [%]"], label="Obtained profits", color="red", alpha=0.8, bins=12)
@@ -187,6 +206,25 @@ if documentation_dir == "profit_dists":
     plt.savefig(f"documentation/{documentation_dir}/percentage_boxplots.png")
     plt.close()
 
+    for agent in results_dict.keys():
+        print(agent)
+        print("Percentage:")
+        print(round(results_dict[agent]["Profit Percentage [%]"].mean(),1))
+        print("EBITDA:")
+        print(round(results_dict[agent]["EBITDA [€]"].mean()/1e6,1))
+        print("VaR:")
+        print(round(results_dict[agent]["EBITDA [€]"].quantile(0.1)/1e6,1))
+        print("Emissions:")
+        print(round(results_dict[agent]["Scope 2 Emissions [tCO2/MWh]"].mean()/3.6*1000,3))
+        print("Defaulting Volume:")
+        print(round(results_dict[agent]["Contract Defaulting [€]"].mean()/3600,0))
+        print("--------")
+    print("Optimal EBITDA:")
+    print(round(results["Optimal Profit [€]"].mean()/1e6,1))
+    print(round(results["Optimal Profit [€]"].quantile(0.1)/1e6,1))
+    print("--------")
+    print("Optimal Emissions:")
+    print(round(results["Scope 2 Emissions Optimal [tCO2/MWh]"].mean()/3.6*1000,3))
 
 if documentation_dir == "intraday_bidding_strategies":
     labels=["No Bidding", "Internal Strike Price Bidding", "Decision Rule Bidding - 1 domain",
@@ -241,6 +279,26 @@ if documentation_dir == "intraday_bidding_strategies":
     fig.tight_layout(rect=[0,0.1,1,1])
     plt.savefig(f"documentation/{documentation_dir}/exposure_comparison.png")
     plt.close()
+
+    for agent in cp_dict.keys(): 
+        print(agent)
+        print("CP in ID:")
+        id_sell = np.mean([float(x.split(": ")[2].split("}")[0]) for x in cp_dict[agent]['sell'].values])
+        id_buy = np.mean([float(x.split(": ")[2].split("}")[0]) for x in cp_dict[agent]['buy'].values])
+        print("Sell: ", round(id_sell,1))
+        print("Buy:", round(id_buy,1))
+        print("CP in DA:")
+        da_sell = np.mean([float(x.split(": ")[1].split(",")[0]) for x in cp_dict[agent]['sell'].values])
+        da_buy = np.mean([float(x.split(": ")[1].split(",")[0]) for x in cp_dict[agent]['buy'].values])
+        print("Sell: ", round(da_sell,1))
+        print("Buy:", round(da_buy,1))
+        print("Overall CP:")
+        id_exp = results_dict[agent]["Balancing Exposure [%]"].mean()
+        cp_sell = id_sell * id_exp + da_sell * (1-id_exp)
+        cp_buy = id_buy * id_exp + da_buy * (1-id_exp)
+        print("Sell: ", round(cp_sell,1))
+        print("Buy:", round(cp_buy,1))
+        print("--------")
 
 fig, ax = plt.subplots(figsize=(16,12))
 sns.histplot(results["Optimal Profit [€]"].values/1e6, label="Optimal EBITDA", color="blue", alpha=0.8, bins=12)
@@ -392,6 +450,7 @@ if documentation_dir == "planning_sensitivity":
     plt.tight_layout()
     plt.savefig(f"documentation/{documentation_dir}/percentage_violins.png")
     plt.close()
+
 if documentation_dir == "scenario_comparisons":
     agent_names = ["PS I\nBS None",
                    "PS II\nBS None",
@@ -466,8 +525,6 @@ if documentation_dir == "scenario_comparisons":
     plt.savefig(f"documentation/{documentation_dir}/scatterplots.png")
     plt.close()
 
-
-
 df = pd.DataFrame()
 for name, r in results_dict.items():
     df[name + "_emissions"] = r["Scope 2 Emissions [tCO2/MWh]"] / 3.6 * 1000
@@ -475,65 +532,130 @@ for name, r in results_dict.items():
     df[name + "_longexposure"] = r["Long Exposure [%]"]
     df[name + "_ebitda"] = r["EBITDA [€]"] / 1e6
 
-fig, ax = plt.subplots(figsize=(12,8))
-ax.scatter(df["RecourseAgent5DAbidding_ebitda"], df["RecourseAgent5DAbidding_emissions"], color='blue', alpha=0.7, s=30)
-plt.ylabel("tCO2 Emissions")
-plt.xlabel("EBITDA (€ million)")
-plt.title("Emissions vs EBITDA for DA Bidding Recourse Agent")
-plt.savefig(f"documentation/{documentation_dir}/emissions_vs_ebitda_DAbiddingagent.png")
-plt.show()
+if documentation_dir == "profit_dists":
+    fig, ax = plt.subplots(figsize=(12,8))
+    ax.scatter(df["RecourseAgent5DAbidding_ebitda"], df["RecourseAgent5DAbidding_emissions"], color='blue', alpha=0.7, s=30)
+    plt.ylabel("tCO2 Emissions")
+    plt.xlabel("EBITDA (€ million)")
+    plt.title("Emissions vs EBITDA for DA Bidding Recourse Agent")
+    plt.savefig(f"documentation/{documentation_dir}/emissions_vs_ebitda_DAbiddingagent.png")
+    plt.show()
 
-# Short Exposure for various agents vs EBITDA
-fig, ax = plt.subplots(figsize=(12,8))
+    # Short Exposure for various agents vs EBITDA
+    fig, ax = plt.subplots(figsize=(12,8))
 
-x, y = df["DeterministicHAproduction_ebitda"], df["DeterministicHAproduction_shortexposure"]
-ax.scatter(x,y, color='blue', alpha=0.7, s=10, label="Deterministic HA")
-ax.scatter(np.mean(x), np.mean(y), color='blue', marker='x', s=200, lw=3)
-x, y = df["StochasticHA5production_ebitda"], df["StochasticHA5production_shortexposure"]
-ax.scatter(x, y, color='green', alpha=0.7, s=10, label="Stochastic HA5")
-ax.scatter(np.mean(x), np.mean(y), color='green', marker='x', s=200, lw=3)
-x, y = df["RecourseAgent1production_ebitda"], df["RecourseAgent1production_shortexposure"]
-ax.scatter(x, y, color='red', alpha=0.7, s=10, label="Recourse Agent")
-ax.scatter(np.mean(x), np.mean(y), color='red', marker='x', s=200, lw=3)
-x, y = df["RecourseAgent5DAbidding_ebitda"], df["RecourseAgent5DAbidding_shortexposure"]
-ax.scatter(x, y, color='orange', alpha=0.7, s=10, label="Recourse Agent DA bidding")
-ax.scatter(np.mean(x), np.mean(y), color='orange', marker='x', s=200, lw=3)
-x, y = df["RecourseAgent5production_ebitda"], df["RecourseAgent5production_shortexposure"]
-ax.scatter(x, y, color='brown', alpha=0.7, s=10, label="Recourse Agent Stoch.")
-ax.scatter(np.mean(x), np.mean(y), color='brown', marker='x', s=200, lw=3)
+    x, y = df["DeterministicHAproduction_ebitda"], df["DeterministicHAproduction_shortexposure"]
+    ax.scatter(x,y, color='blue', alpha=0.7, s=10, label="Deterministic HA")
+    ax.scatter(np.mean(x), np.mean(y), color='blue', marker='x', s=200, lw=3)
+    # x, y = df["StochasticHA5production_ebitda"], df["StochasticHA5production_shortexposure"]
+    # ax.scatter(x, y, color='green', alpha=0.7, s=10, label="Stochastic HA5")
+    # ax.scatter(np.mean(x), np.mean(y), color='green', marker='x', s=200, lw=3)
+    x, y = df["RecourseAgent1production_ebitda"], df["RecourseAgent1production_shortexposure"]
+    ax.scatter(x, y, color='red', alpha=0.7, s=10, label="Recourse Agent")
+    ax.scatter(np.mean(x), np.mean(y), color='red', marker='x', s=200, lw=3)
+    x, y = df["RecourseAgent5DAbidding_ebitda"], df["RecourseAgent5DAbidding_shortexposure"]
+    ax.scatter(x, y, color='orange', alpha=0.7, s=10, label="Recourse Agent DA bidding")
+    ax.scatter(np.mean(x), np.mean(y), color='orange', marker='x', s=200, lw=3)
+    # x, y = df["RecourseAgent5production_ebitda"], df["RecourseAgent5production_shortexposure"]
+    # ax.scatter(x, y, color='brown', alpha=0.7, s=10, label="Recourse Agent Stoch.")
+    # ax.scatter(np.mean(x), np.mean(y), color='brown', marker='x', s=200, lw=3)
 
-plt.xlabel("EBITDA (€ million)")
-plt.ylabel("Short Exposure [%]")
-plt.title("EBITDA vs Exposure")
-plt.legend()
-plt.savefig(f"documentation/{documentation_dir}/ebitda_vs_shortexp.png")
-plt.close()
+    plt.xlabel("EBITDA (€ million)")
+    plt.ylabel("Short Exposure [%]")
+    plt.title("EBITDA vs Exposure")
+    plt.legend()
+    plt.savefig(f"documentation/{documentation_dir}/ebitda_vs_shortexp.png")
+    plt.close()
 
 
-# Long Exposure for various agents vs EBITDA
-fig, ax = plt.subplots(figsize=(12,8))
+    # Long Exposure for various agents vs EBITDA
+    fig, ax = plt.subplots(figsize=(12,8))
 
-x, y = df["DeterministicHAproduction_ebitda"], df["DeterministicHAproduction_longexposure"]
-ax.scatter(x,y, color='blue', alpha=0.7, s=10, label="Deterministic HA")
-ax.scatter(np.mean(x), np.mean(y), color='blue', marker='x', s=200, lw=3)
-x, y = df["StochasticHA5production_ebitda"], df["StochasticHA5production_longexposure"]
-ax.scatter(x, y, color='green', alpha=0.7, s=10, label="Stochastic HA5")
-ax.scatter(np.mean(x), np.mean(y), color='green', marker='x', s=200, lw=3)
-x, y = df["RecourseAgent1production_ebitda"], df["RecourseAgent1production_longexposure"]
-ax.scatter(x, y, color='red', alpha=0.7, s=10, label="Recourse Agent")
-ax.scatter(np.mean(x), np.mean(y), color='red', marker='x', s=200, lw=3)
-x, y = df["RecourseAgent5DAbidding_ebitda"], df["RecourseAgent5DAbidding_longexposure"]
-ax.scatter(x, y, color='orange', alpha=0.7, s=10, label="Recourse Agent DA bidding")
-ax.scatter(np.mean(x), np.mean(y), color='orange', marker='x', s=200, lw=3)
-x, y = df["RecourseAgent5production_ebitda"], df["RecourseAgent5production_longexposure"]
-ax.scatter(x, y, color='brown', alpha=0.7, s=10, label="Recourse Agent Stoch.")
-ax.scatter(np.mean(x), np.mean(y), color='brown', marker='x', s=200, lw=3)
+    x, y = df["DeterministicHAproduction_ebitda"], df["DeterministicHAproduction_longexposure"]
+    ax.scatter(x,y, color='blue', alpha=0.7, s=10, label="Deterministic HA")
+    ax.scatter(np.mean(x), np.mean(y), color='blue', marker='x', s=200, lw=3)
+    # x, y = df["StochasticHA5production_ebitda"], df["StochasticHA5production_longexposure"]
+    # ax.scatter(x, y, color='green', alpha=0.7, s=10, label="Stochastic HA5")
+    # ax.scatter(np.mean(x), np.mean(y), color='green', marker='x', s=200, lw=3)
+    x, y = df["RecourseAgent1production_ebitda"], df["RecourseAgent1production_longexposure"]
+    ax.scatter(x, y, color='red', alpha=0.7, s=10, label="Recourse Agent")
+    ax.scatter(np.mean(x), np.mean(y), color='red', marker='x', s=200, lw=3)
+    # x, y = df["RecourseAgent5DAbidding_ebitda"], df["RecourseAgent5DAbidding_longexposure"]
+    # ax.scatter(x, y, color='orange', alpha=0.7, s=10, label="Recourse Agent DA bidding")
+    # ax.scatter(np.mean(x), np.mean(y), color='orange', marker='x', s=200, lw=3)
+    x, y = df["RecourseAgent5production_ebitda"], df["RecourseAgent5production_longexposure"]
+    ax.scatter(x, y, color='brown', alpha=0.7, s=10, label="Recourse Agent Stoch.")
+    ax.scatter(np.mean(x), np.mean(y), color='brown', marker='x', s=200, lw=3)
 
-plt.xlabel("EBITDA (€ million)")
-plt.ylabel("Long Exposure [%]")
-plt.title("EBITDA vs Exposure")
-plt.legend()
-plt.savefig(f"documentation/{documentation_dir}/ebitda_vs_longexp.png")
-plt.close()
+    plt.xlabel("EBITDA (€ million)")
+    plt.ylabel("Long Exposure [%]")
+    plt.title("EBITDA vs Exposure")
+    plt.legend()
+    plt.savefig(f"documentation/{documentation_dir}/ebitda_vs_longexp.png")
+    plt.close()
+
+if documentation_dir == "ppa_only_results":
+    df_ebitda = pd.DataFrame()
+    df_optimals = pd.DataFrame()
+    df_emissions = pd.DataFrame()
+    df_emissions_optimal = pd.DataFrame()
+
+    for name, r in results_dict.items():
+        df_optimals[name] = r["Optimal Profit [€]"]/1e6
+        df_emissions_optimal[name] = r["Scope 2 Emissions Optimal [tCO2/MWh]"]/3.6 * 1000
+        df_ebitda[name] = r["EBITDA [€]"]/1e6
+        df_emissions[name] = r["Scope 2 Emissions [tCO2/MWh]"]/3.6 * 1000
+    dfs = [df_ebitda, df_emissions,]
+    dfs_names = ["EBITDA [€ million]", r"Emissions [gCO$_2$/MJ]" ]
+    scenario_names = ['Base Case', 'No Solar', 'High VRE']
+    agent_names = ["PS II\nBS None\nNo Intraday\n",
+                   "PS II\nBS None\nWith Intraday\n",
+                   "PS II\nBS I\nWith Intraday\n",
+                   ]
+    xlabels = []
+    xlabels_emissions = []
+    for scen in scenario_names:
+        xlabels_emissions += ["", scen, ""]
+        xlabels += ["", scen, "", ""]
+    
+    # I want to construct a boxplot with df_ebitdas columns as different boxes, grouped by scenario and agent.
+    # df_ebitdas columns should be placed at xticks [0,1,2,4,5,6,8,9,10] for 3 scenarios and 3 agents.
+    # df_optimals columns should be placed at xticks [3,7,11] for 3 scenarios.
+    x_ticks_ebitda = []
+    for i in range(len(scenario_names)):
+        for j in range(len(agent_names)):
+            x_ticks_ebitda.append(i*4 + j)
+    x_ticks_all = np.arange(12)
+    x_ticks_opt = [3,7,11]
+    ebitda_cols = df_ebitda.columns
+    opt_cols = [df_optimals.columns[i] for i in [0,3,6]]
+
+    fig, axs = plt.subplots(2, 1, figsize=(12,10))
+    axs = axs.flatten()
+
+    for ix in x_ticks_all:
+        if ix in x_ticks_ebitda:
+            jx = x_ticks_ebitda.index(ix)
+            lbl = agent_names[jx] if jx<len(agents) else ''
+            sns.boxplot(x=ix, y=df_ebitda[ebitda_cols[jx]].values, color=colors[jx], ax=axs[0], label=lbl, legend=None)
+            sns.boxplot(x=ix, y=df_emissions[ebitda_cols[jx]].values, color=colors[jx], ax=axs[1], label="", legend=None)
+        else:
+            jx = x_ticks_opt.index(ix)
+            lbl = 'Perfect\nForesight' if jx==0 else ''
+            sns.boxplot(x=ix, y=df_optimals[opt_cols[jx]].values, color='black', ax=axs[0], label=lbl, legend=None)
+            sns.boxplot(x=ix, y=df_emissions_optimal[opt_cols[jx]].values, color='black', ax=axs[1], label="", legend=None)
+    axs[0].set_xticks(x_ticks_all)
+    axs[0].set_xticklabels(xlabels, ha='left', fontweight='bold')
+    axs[0].set_ylabel("EBITDA [€ million]")
+    # sns.boxplot(df_emissions.values, palette=colors, ax=axs[1])
+    # axs[1].set_xticks(np.arange(len(xlabels_emissions)))
+    axs[1].set_xticks(x_ticks_all)
+    # axs[1].set_xticklabels(xlabels_emissions, ha='center', fontweight='bold')
+    axs[1].set_xticklabels(xlabels, ha='left', fontweight='bold')
+    axs[1].set_ylabel(r"Emissions [gCO$_2$/MJ]")
+    fig.legend(ncol=1, bbox_to_anchor=(0.89,0.5), loc='center')
+    fig.tight_layout(rect=[0,0,0.8,1])
+    plt.savefig(f"documentation/{documentation_dir}/ppa_only_boxplots.png")
+    plt.close()
 
 print("Done")

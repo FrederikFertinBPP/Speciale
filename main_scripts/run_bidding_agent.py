@@ -10,16 +10,16 @@ from model_scripts.environment import RFPRecourseEnv, get_env
 from model_scripts.agent_hierarchical_heuristic import BiddingCurveAgent
 
 def main():
-    n_episodes = 50
+    n_episodes = 1
     solver = 'gurobi'
     planning_horizon = 4*24
     allow_spot_buy = True
     n_scenarios = 1
     guideline = "production_value"
 
-    env = get_env(RFPRecourseEnv, allow_spot_buy=allow_spot_buy, balancing_market=True, verbose=True ,load_data=True)
+    env = get_env(RFPRecourseEnv, allow_spot_buy=allow_spot_buy, balancing_market=True, verbose=True, load_data=True)
     
-    agent = BiddingCurveAgent(env=env, solver=solver, documentation=False,
+    agent = BiddingCurveAgent(env=env, solver=solver, documentation=True,
                             guideline=guideline, planning_horizon=planning_horizon, n_scenarios=n_scenarios,
                             mode="eval", no_train=True,
                             )
@@ -28,7 +28,8 @@ def main():
     
     experiment_name = "_".join(["test", str(agent), "ph", str(planning_horizon), "spot", str(allow_spot_buy)])
     print("Start experiment: ", experiment_name)
-    stats, trajectories = train(env, agent, experiment_name=experiment_name, num_episodes=n_episodes, save_every=10)
+    # stats, trajectories = train(env, agent, experiment_name=experiment_name, num_episodes=n_episodes, save_every=10)
+    stats, trajectories = train(env, agent, num_episodes=1, verbose=True)
     agent.close()
 
     print("Experiment done")
@@ -36,4 +37,9 @@ def main():
 
 import cProfile
 if __name__ == '__main__':
-    cProfile.run("main()", "run_profiles/run_TrainDecisionRule.prof")
+    cProfile.run("main()", "run_profiles/run_DRAgent_1.prof")
+    # Example of how to read the profile results:
+    import pstats
+    prof = pstats.Stats("run_profiles/run_DRAgent_1.prof")
+    prof.strip_dirs().sort_stats("cumtime").print_stats(10)
+    # cProfile.py -- Profile Python programs

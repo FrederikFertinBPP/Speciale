@@ -14,7 +14,7 @@ def main():
     planning_horizon = 4*24
     n_strike_prices = 1
     n_scenarios = 1
-    n_episodes = 50
+    n_episodes = 1
     solver = 'gurobi'
 
     """ Set experiment name """
@@ -35,11 +35,17 @@ def main():
 
     experiment_name = "_".join(["test", str(agent), guideline, "ph", str(planning_horizon), "spot", str(allow_spot_buy)])
     print("Start experiment: ", experiment_name)
-    stats, trajectories = train(env, agent, experiment_name=experiment_name, num_episodes=n_episodes, verbose=True)
+    # stats, trajectories = train(env, agent, experiment_name=experiment_name, num_episodes=n_episodes, verbose=True)
+    stats, trajectories = train(env, agent, num_episodes=1, verbose=True)
     agent.close()
     print("Experiment done")
 
 
 import cProfile
 if __name__ == '__main__':
-    cProfile.run("main()", "run_profiles/run_TrainDecisionRule.prof")
+    cProfile.run("main()", "run_profiles/run_StrikePriceAgent.prof")
+    # Example of how to read the profile results:
+    import pstats
+    prof = pstats.Stats("run_profiles/run_StrikePriceAgent.prof")
+    prof.strip_dirs().sort_stats("cumtime").print_stats(10)
+    # cProfile.py -- Profile Python programs

@@ -172,7 +172,7 @@ def get_realization_summary(trajectory, stats, rfp):
 
     ammonia_produced = np.sum([sum(trajectory.env_info[t]['link_productions']['Haber Bosch Plant']) for t in T])
 
-    emissions_summary["fuel_emissions_intensity"] = emissions_summary["balance"] / (hydrogen_produced * (120/3.6) + (18.6/3.6 - (120/3.6)/5.5) * ammonia_produced)
+    emissions_summary["fuel_emissions_intensity"] = emissions_summary["balance"] / (hydrogen_produced * 120/3.6 + (18.6/3.6 - (120/3.6)/5.5) * ammonia_produced)
 
     revenue_exposure = el_sold / (el_sold + power_consumption)
     cost_exposure = el_bought / (el_bought + power_contracted)
@@ -193,7 +193,7 @@ def get_realization_summary(trajectory, stats, rfp):
     return (spot_summary, capture_price_summary, emissions_summary, ppa_capacity_factor, contract_revenues, contract_penalties,
             ppa_cost, el_revenue, contracted_revenue, contract_penalty,
             revenue_exposure, cost_exposure, short_exposure, long_exposure, balancing_exposure,
-            emissions_summary["fuel_emissions_intensity"], realized_total_revenue, hydrogen_produced)
+            emissions_summary["fuel_emissions_intensity"], realized_total_revenue, hydrogen_produced, grid_emission_factor)
 
 def print_trajectory_summary(trajectory, stats, rfp, model_class = HourlyDeterministicLPModel, opt_model=None):
     normalized = stats.get("normalized",False)
@@ -203,12 +203,19 @@ def print_trajectory_summary(trajectory, stats, rfp, model_class = HourlyDetermi
     (spot_summary, capture_price_summary, emissions_summary, ppa_capacity_factor, contract_revenues, contract_penalties,
             ppa_cost, el_revenue, contracted_revenue, contract_penalty,
             revenue_exposure, cost_exposure, short_exposure, long_exposure, balancing_exposure,
-            emissions_intensity, realized_total_revenue, hydrogen_produced) = get_realization_summary(trajectory=trajectory, stats=stats, rfp=rfp)
+            emissions_intensity, realized_total_revenue, hydrogen_produced, grid_emission_factor) = get_realization_summary(trajectory=trajectory, stats=stats, rfp=rfp)
 
     #%% Electricity revenue summary
     if opt_model is None:
         opt_model = get_hindsight_solution(trajectory=trajectory, stats=stats, rfp=rfp, model_class=model_class)
     opt_el_revenue = opt_model.decision_results.exp_el_revenue
+
+    opt_emissions = emissions_summary["totals"]["baseload_ppa"] + opt_model.decision_results.da_buy @ grid_emission_factor
+    opt_hydrogen_produced = opt_model.decision_results.link_production["Electrolyzer"].sum()
+    opt_ammonia_produced = opt_model.decision_results.link_production["Haber Bosch Plant"].sum()
+    opt_emissions_intensity = opt_emissions / (opt_hydrogen_produced * 120/3.6 + (18.6/3.6 - (120/3.6)/5.5) * opt_ammonia_produced)
+    print("Realized scope II emissions intensity:\t", np.round(emissions_intensity,3), "tCO2/MWh")
+    print("Optimal scope II emissions intensity:\t", np.round(opt_emissions_intensity,3), "tCO2/MWh")
     print("\n----------------------------------\n")
     print("Achieved electricity revenue:\t", round(spot_summary["revenue"]["total"]))
     print("Optimal electricity revenue:\t", round(opt_el_revenue))
@@ -260,6 +267,7 @@ def print_trajectory_summary(trajectory, stats, rfp, model_class = HourlyDetermi
                         "Revenue Exposure [%]": revenue_exposure, "Cost Exposure [%]": cost_exposure, 
                         "Balancing Exposure [%]": balancing_exposure, "Scope 2 Emissions [tCO2/MWh]": emissions_intensity,
                         "Hydrogen Produced [tH2]": hydrogen_produced, "Episode Runtime [s]": runtime,
+                        "Scope 2 Emissions Optimal [tCO2/MWh]": opt_emissions_intensity
                         }
 
     return opt_model, trajectory_summary, emissions_summary, capture_price_summary, ppa_capacity_factor
@@ -285,11 +293,11 @@ if __name__ == '__main__':
                    "test_BiddingCurveAgent1_D2_ph_96_spot_True",
                    "test_BiddingCurveAgent1_D3_ph_96_spot_True",
                 )
-    experiments = ("planningsensitivity_DeterministicHA_production_value_ph_24_spot_True", 
-                   "planningsensitivity_DeterministicHA_production_value_ph_48_spot_True", 
-                   "planningsensitivity_DeterministicHA_production_value_ph_72_spot_True", 
-                   "planningsensitivity_DeterministicHA_production_value_ph_96_spot_True", 
-                   )
+    # experiments = ("planningsensitivity_DeterministicHA_production_value_ph_24_spot_True", 
+    #                "planningsensitivity_DeterministicHA_production_value_ph_48_spot_True", 
+    #                "planningsensitivity_DeterministicHA_production_value_ph_72_spot_True", 
+    #                "planningsensitivity_DeterministicHA_production_value_ph_96_spot_True", 
+    #                )
     # experiments = ("test_RecourseAgent5_production_value_ph_96_spot_True",
     #                "test_RecourseAgent5_DAbidding_production_value_ph_96_spot_True",
     #             )

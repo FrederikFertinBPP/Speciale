@@ -9,29 +9,8 @@ from common_scripts import train
 from model_scripts.environment import RFPRecourseEnv, get_env
 from model_scripts.agent_hierarchical_heuristic import BiddingCurveAgent
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-sns.set_theme("notebook", font_scale=1.5, style="darkgrid")
-plt.rcParams['font.size'] = 16
-# set legend fontsize to 14
-plt.rcParams['legend.fontsize'] = 18
-# set the font weight of the legend to bold
-plt.rcParams['legend.title_fontsize'] = 18
-# set the font size of the x and y labels to 14
-plt.rcParams['axes.labelsize'] = 18
-# set the font weight of the x and y labels to bold
-plt.rcParams['axes.labelweight'] = 'bold'
-# set the font size of the x and y ticks to 12
-plt.rcParams['xtick.labelsize'] = 16
-plt.rcParams['ytick.labelsize'] = 16
-# set the font size of the title to 16
-plt.rcParams['axes.titlesize'] = 18
-# set the font weight of the title to bold
-plt.rcParams['axes.titleweight'] = 'bold'
-
 def main():
-    n_episodes = 50
+    n_episodes = 1
     solver = 'gurobi'
     planning_horizon = 4*24
     allow_spot_buy = True
@@ -43,14 +22,15 @@ def main():
     agent = BiddingCurveAgent(env=env, solver=solver, documentation=False,
                               guideline=guideline, planning_horizon=planning_horizon, n_scenarios=n_scenarios,
                               mode="eval", no_train=True,
-                              n_price_domains=2, domain_prices=[80],
+                              n_price_domains=3, domain_prices=[80, 80*1.4],
                             )
     training_experiment = "_".join(["train", str(agent), "spot", str(allow_spot_buy)])
     agent.load(os.getcwd() + f"/models/rl_models/{training_experiment}")
     
     experiment_name = "_".join(["test", str(agent), "ph", str(planning_horizon), "spot", str(allow_spot_buy)])
     print("Start experiment: ", experiment_name)
-    stats, trajectories = train(env, agent, experiment_name=experiment_name, num_episodes=n_episodes, save_every=10)
+    # stats, trajectories = train(env, agent, experiment_name=experiment_name, num_episodes=n_episodes, save_every=10)
+    stats, trajectories = train(env, agent, num_episodes=1, verbose=True)
     agent.close()
 
     print("Experiment done")
@@ -58,4 +38,9 @@ def main():
 
 import cProfile
 if __name__ == '__main__':
-    cProfile.run("main()", "run_profiles/run_TrainDecisionRule.prof")
+    cProfile.run("main()", "run_profiles/run_DRAgent_3.prof")
+    # Example of how to read the profile results:
+    import pstats
+    prof = pstats.Stats("run_profiles/run_DRAgent_3.prof")
+    prof.strip_dirs().sort_stats("cumtime").print_stats(10)
+    # cProfile.py -- Profile Python programs

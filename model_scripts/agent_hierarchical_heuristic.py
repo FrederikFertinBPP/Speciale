@@ -277,7 +277,8 @@ class DeterministicHA(HierarchicalAgent):
                 max_x = max(max_x, _sorted['cumulative_prod'].values[-1])
         if self.documentation:
             ax.set_xlim(0, max_x)
-            ax.axhline(y=np.mean(strike_prices), label=lbl2, color='blue', linestyle='--', lw=3, alpha=1)
+            ax.axhline(y=np.mean(strike_prices), color='purple', linestyle='--', lw=3, alpha=1,
+                       label=r"ISP$_e$ = "+str(round(np.mean(strike_prices),1))+" €/MWh")
             ax.axvline(x=target_volume_current['yearly'], label="Missing Contracted Ammonia Production", color='red', linestyle='--')
             ax.legend()
             ax.set_title(f"Estimate on {str(time.date())}")

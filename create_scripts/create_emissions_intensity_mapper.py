@@ -8,25 +8,9 @@ import numpy as np
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import root_mean_squared_error
 import matplotlib.pyplot as plt
-import seaborn as sns
-
-sns.set_theme("paper", font_scale=1.5, style="darkgrid")
-plt.rcParams['font.size'] = 16
-# set legend fontsize to 14
-plt.rcParams['legend.fontsize'] = 18
-# set the font weight of the legend to bold
-plt.rcParams['legend.title_fontsize'] = 18
-# set the font size of the x and y labels to 14
-plt.rcParams['axes.labelsize'] = 18
-# set the font weight of the x and y labels to bold
-plt.rcParams['axes.labelweight'] = 'bold'
-# set the font size of the x and y ticks to 12
-plt.rcParams['xtick.labelsize'] = 16
-plt.rcParams['ytick.labelsize'] = 16
-# set the font size of the title to 16
-plt.rcParams['axes.titlesize'] = 18
-# set the font weight of the title to bold
-plt.rcParams['axes.titleweight'] = 'bold'
+import statsmodels.api as sm
+from common_scripts.utils import set_plotting_style
+set_plotting_style()
 
 df_ren_prices = pd.read_csv("historical_data/clean_dataframes/server-ENTSOEcountry-PT2024-01-01to2024-12-31.csv", index_col=0)
 df_ren_prices.index = pd.to_datetime(df_ren_prices.index, utc=True)
@@ -80,6 +64,11 @@ model.fit(X=X, y=y_true)
 y_pred = model.predict(X)
 print(root_mean_squared_error(y_true, y_pred))
 
+X_ols = sm.add_constant(X)
+model = sm.OLS(y_true, X_ols)
+results = model.fit()
+print(results.summary())
+
 fig, ax = plt.subplots(figsize=(16,12))
 plt.scatter(y_true.values, y_pred,label="Model Prediction", s=10)
 plt.scatter(y_true.values, y_true.values,label="True Value", color="black", s=10)
@@ -96,6 +85,20 @@ plt.ylabel("Residuals (gCO2/kWh)")
 plt.legend()
 plt.savefig('documentation/co2_intensity_mapper/prediction_residuals.png')
 plt.close()
+
+fig, ax = plt.subplots(figsize=(16,12))
+plt.scatter(y_true.index,y_true.values/3.6,label="Hourly emissions intensity", s=10, color='red', alpha=0.2)
+plt.axhline(18, label="RFNBO requirement", color='black', lw=3, linestyle="--")
+plt.axhline(np.mean(y_true.values)/3.6, label="Average emissions intensity (direct)", color='red', lw=3)
+plt.xlabel("Date")
+plt.ylabel("Residuals (gCO2/MJ)")
+plt.legend()
+plt.xlim(y_true.index[0], y_true.index[-1])
+plt.tight_layout()
+plt.savefig('documentation/co2_intensity_mapper/emissions_data.png')
+plt.close()
+
+
 
 cache_path = os.getcwd() + "/models/plant_models/emission_factor.pkl"
 cache_write(model, cache_path, verbose=True)

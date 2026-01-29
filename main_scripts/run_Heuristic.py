@@ -33,4 +33,9 @@ def main():
 
 import cProfile
 if __name__ == '__main__':
-    cProfile.run("main()", "run_profiles/run_DeterministicSpotBuy.prof")
+    cProfile.run("main()", "run_profiles/run_DeterministicSpotBuy_24.prof")
+    # Example of how to read the profile results:
+    import pstats
+    prof = pstats.Stats("run_profiles/run_DeterministicSpotBuy_24.prof")
+    prof.strip_dirs().sort_stats("cumtime").print_stats(10)
+    # cProfile.py -- Profile Python programs
