@@ -204,6 +204,7 @@ def train(env:Env,
           seed=None, # Attempt to set the seed of the random number generator to produce reproducible results.
           continue_trajectories_and_stats=False,
           starting_episode=None,
+          options=None, # Dict for passing reset options to environment.
           ):
     """This function implements the main training loop as described in (Her25, Subsection 4.4.4).
 
@@ -271,7 +272,10 @@ def train(env:Env,
                 seed_ = seed[i_episode]
             else:
                 seed_ = seed
-            obs, info_s = env.reset(seed=seed_, options={"scenario_number": i_episode}) # Reset the environment at the beginning of each episode. 
+            _options = {"scenario_number": i_episode}
+            if options is not None:
+                _options = {**_options, **options}
+            obs, info_s = env.reset(seed=seed_, options=_options) # Reset the environment at the beginning of each episode. 
 
             reward = []
             trajectory = Trajectory(time=[], state=[], action=[], reward=[], env_info=[])
@@ -280,7 +284,7 @@ def train(env:Env,
             for _ in itertools.count():
                 # Main train loop:
                 if verbose and k%3==2:
-                    print(f"Episode: {i_episode + 1}, iter: {k+1}")
+                    print(f"Episode: {i_episode + 1}, iter: {k+1}, time: {info_s.get('time', None)}")
                 a = agent.pi(obs, k, info_s)
                 k += 1
                 if hasattr(env, 'step_with_hourly_model') and env.step_with_hourly_model:

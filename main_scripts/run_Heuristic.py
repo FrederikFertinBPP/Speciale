@@ -7,10 +7,11 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from common_scripts import train # stats, trajectories = train(env, agent, num_episodes=n_episodes, verbose=True, seed=42)
-from model_scripts.environment import RFPEnv, get_env
+from model_scripts.environment import RFPModelActionsEnv, get_env
 from model_scripts.agent_hierarchical_heuristic import DeterministicHA
 
 def main():
+    rfp_case = "small"
     planning_horizon = 96
     allow_spot_buy = True
     solver = 'gurobi'
@@ -20,13 +21,14 @@ def main():
     
     n_episodes = 1
     
-    env = get_env(RFPEnv, allow_spot_buy=allow_spot_buy, balancing_market=False, verbose=True, load_data=True)
+    env_config = {"allow_spot_buy": allow_spot_buy, "balancing_market": False, "verbose": True, "load_data": True, "inflexible": True}
+    env = get_env(RFPModelActionsEnv, env_config=env_config, layout_file="rfp_layout - resized.xlsx")
     
-    agent = DeterministicHA(env=env, solver=solver, planning_horizon=planning_horizon, guideline=guideline, documentation=True)
+    agent = DeterministicHA(env=env, solver=solver, planning_horizon=planning_horizon, guideline=guideline, documentation=False)
     
-    experiment_name = "_".join(["planningsensitivity", str(agent), guideline, "ph", str(planning_horizon), "spot", str(allow_spot_buy)])
+    experiment_name = "_".join(["test_contract", str(agent), guideline, "ph", str(planning_horizon), "spot", str(allow_spot_buy), rfp_case])
     print("Start experiment: ", experiment_name)
-    stats, trajectories = train(env, agent, num_episodes=1, verbose=True)
+    stats, trajectories = train(env, agent, num_episodes=1, verbose=True, experiment_name=experiment_name)
     agent.close()
     print("Experiment done")
 

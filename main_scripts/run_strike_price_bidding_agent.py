@@ -10,6 +10,7 @@ from model_scripts.environment import RFPRecourseEnv, get_env
 from model_scripts.agent_hierarchical_heuristic import StrikePriceBiddingAgent
 
 def main():
+    rfp_case = "small"
     allow_spot_buy = True
     planning_horizon = 4*24
     n_strike_prices = 1
@@ -20,7 +21,8 @@ def main():
     """ Set experiment name """
     guideline = "production_value" # Reward production of ammonia based on estimating internal value of ammonia.
     
-    env = get_env(RFPRecourseEnv, allow_spot_buy=allow_spot_buy, balancing_market=True, verbose=True, load_data=True)
+    env_config = {"allow_spot_buy": allow_spot_buy, "balancing_market": True, "verbose": True, "load_data": True, "inflexible": True}
+    env = get_env(RFPRecourseEnv, env_config=env_config, layout_file="rfp_layout - resized.xlsx")
     
     agent = StrikePriceBiddingAgent(env=env,
                             solver=solver,
@@ -33,10 +35,10 @@ def main():
                             )
     
 
-    experiment_name = "_".join(["test", str(agent), guideline, "ph", str(planning_horizon), "spot", str(allow_spot_buy)])
+    experiment_name = "_".join(["test", str(agent), guideline, "ph", str(planning_horizon), "spot", str(allow_spot_buy), rfp_case])
     print("Start experiment: ", experiment_name)
-    # stats, trajectories = train(env, agent, experiment_name=experiment_name, num_episodes=n_episodes, verbose=True)
-    stats, trajectories = train(env, agent, num_episodes=1, verbose=True)
+    stats, trajectories = train(env, agent, experiment_name=experiment_name, num_episodes=n_episodes, verbose=True)
+    # stats, trajectories = train(env, agent, num_episodes=1, verbose=True)
     agent.close()
     print("Experiment done")
 

@@ -7,6 +7,11 @@ import numpy as np
 import pandas as pd
 
 
+""" Only implemented in the base hourly model currently:
+    self.model.spot_shipment
+
+"""
+
 class HourlyDeterministicLPModel:
     """ --- Hardcoded exceptions to general formulation:
         plant_electricity:      The energy carrier for electricity within the RFP, which is impacted by elec_cons from units.
@@ -26,6 +31,7 @@ class HourlyDeterministicLPModel:
 
     def __init__(self,
                  rfp: RenewableFuelPlant,
+                 inflexible: bool = False,
                  planning_horizon: int = 4*24,
                  decision_horizon: int = 24,
                  solver: str = 'scip',
@@ -38,6 +44,7 @@ class HourlyDeterministicLPModel:
         
         # Problem specific parameters:
         self.rfp              = rfp
+        self.inflexible       = inflexible
         self.decision_horizon = decision_horizon
         self.planning_horizon = max(planning_horizon, self.decision_horizon)
         self.allow_spot_buy   = allow_spot_buy
@@ -90,15 +97,20 @@ class HourlyDeterministicLPModel:
 
         # Mutable model parameters:
         self.model.T_datetime   = pyo.Param(self.model.T, within=pyo.Any, initialize=pd.date_range(start=0, end=self.planning_horizon - 1, freq='h'), mutable=True)
+        self.model.timedelta    = pyo.Param(self.model.T, within=pyo.NonNegativeReals, default=1, mutable=True) # Time step duration in hours. Used for scaling of flows.
         self.model.init_soc           = pyo.Param(self.model.storages, within=pyo.NonNegativeReals, default=0, mutable=True)
         self.model.supplier_cf        = pyo.Param(self.model.ppas, self.model.T, within=pyo.NonNegativeReals, default=1, mutable=True)
         self.model.init_contract_status         = pyo.Param(self.model.contracts, within=pyo.NonNegativeReals, default=0, mutable=True)
         self.model.electricity_price            = pyo.Param(self.model.T, within=pyo.Reals, default=50, mutable=True)
-        # self.model.offtaker_availability        = pyo.Param(self.model.offtakers, self.model.T, within=pyo.Binary, default=1, mutable=True)
+        self.model.prev_link_setpoints          = pyo.Param(self.model.links, within=pyo.NonNegativeReals, default=0.5, mutable=True)
+        
+        # If extra spot deal shipment is needed:
+        self.model.spot_shipment = pyo.Param(within=pyo.Binary, default=0, mutable=True)
 
         # Guideline related mutable parameters:
         if self.guideline == "production_value": # Specified value of outflow of links.
             self.model.production_value = pyo.Param(self.model.links, within=pyo.Reals, default=0, mutable=True)
+            self.model.shipment_value = pyo.Param(self.model.contracts, within=pyo.Reals, default=0, mutable=True)
             self.steering_variables[self.guideline] = {key:0 for key in self.rfp.get_links().keys()}
         elif self.guideline == "hourly_target": # Hourly target for ammonia production.
             self.model.hourly_target = pyo.Param(within=pyo.NonNegativeReals, default=0, mutable=True)
@@ -162,20 +174,51 @@ class HourlyDeterministicLPModel:
             link            = self.rfp.get_component(lin)
             b._name         = link.name
             b.rate          = link.parameters.get("rate", 1)
+            assert b.rate > 0, f"Link {b._name} has non-positive conversion rate, which is not supported in the current model formulation."
             b.capacity      = link.parameters.get('capacity', np.inf)
             b.ec            = link.parameters.get("electricity_consumption", 0) # Electricity consumption rate
             b.carrier_in    = str(link.parameters["consumes"])
             b.carrier_out   = str(link.parameters["produces"])
-            b.in_flow       = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.capacity/b.rate))
-            b.out_flow      = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.capacity))
-            if b.ec > 0:
+            b.in_capacity   = b.capacity / b.rate
+            b.max_ramp_up   = link.parameters.get('max_ramp_up', 1) * b.in_capacity
+            b.max_ramp_down = link.parameters.get('max_ramp_down', 1) * b.in_capacity
+
+            b.min_load      = link.parameters.get('min_load', 0) * self.inflexible # If inflexible, we set min_load to the given value. If flexible, we set min_load to 0, which means that the flow can be reduced to 0 if desired.
+            b.in_flow       = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(b.min_load*b.in_capacity, b.in_capacity))
+            b.out_flow      = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(b.min_load*b.capacity, b.capacity))
+            def conversion_rule(m, t):
+                return b.out_flow[t] == b.rate * b.in_flow[t]
+            b.conversion_constraint = pyo.Constraint(self.model.T, rule=conversion_rule)
+            if self.inflexible and bool(link.parameters.get('efficiency_curve', 0)):
+                ec_rule = lambda m, t, segment: pyo.Constraint.Skip
+                b.max_electricity_consumption = None
+                slope = None
+                if b._name == "Electrolyzer":
+                    # Implement piecewise linear efficiency curve.
+                    data = pd.read_json("setup_files/" + link.parameters['efficiency_curve'], orient="index")
+                    slope = np.asarray(data.loc['a'].values[0])
+                    intercept = np.asarray(data.loc['b'].values[0])
+                    # Slope and intercept relate y = b * Capacity + a * x, where x is power (MW) and y is mass outflow (kg/h)
+                    b.max_electricity_consumption = b.capacity / (slope[-1] + intercept[-1]) * 1000
+                    def ec_rule(m, t, segment):
+                        return b.out_flow[t] <= (slope[segment] * b.elec_cons[t] + intercept[segment] * b.max_electricity_consumption) / 1000
+                elif b._name == "Haber Bosch Plant":
+                    # Implement piecewise linear efficiency curve.
+                    data = pd.read_excel("setup_files/" + link.parameters['efficiency_curve'], sheet_name="Piecewise")
+                    data = data.dropna(how="all")
+                    slope = np.asarray(data['a'].values)
+                    intercept = np.asarray(data['b'].values)
+                    b.max_electrical_consumption = b.capacity * (intercept[-1] + slope[-1])
+                    def ec_rule(m, t, segment):
+                        return b.elec_cons[t] >= slope[segment] * b.out_flow[t] + intercept[segment] * b.capacity
+                b.segments = pyo.RangeSet(0, len(slope)-1)
+                b.elec_cons = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.max_electricity_consumption))
+                b.ec_constraints = pyo.Constraint(self.model.T, b.segments, rule=ec_rule)
+            elif b.ec > 0:
                 b.elec_cons = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.capacity * b.ec))
                 def ec_rule(m, t):
                     return b.elec_cons[t] == b.ec * b.out_flow[t]
                 b.ec_constraint = pyo.Constraint(self.model.T, rule=ec_rule)
-            def conversion_rule(m, t):
-                return b.out_flow[t] == b.rate * b.in_flow[t]
-            b.conversion_constraint = pyo.Constraint(self.model.T, rule=conversion_rule)
             # if self.guideline == 'hourly_target' and b._name == "Haber Bosch Plant":
             #     b.hourly_slack = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.capacity))
         self.model.linkBlocks = pyo.Block(self.model.links, rule=linkBlock_rule)
@@ -208,17 +251,21 @@ class HourlyDeterministicLPModel:
             b.target_frequency      = contract.parameters.get("target_frequency", None)
             b.shipment_frequency    = contract.parameters.get("shipment_frequency", None)
 
-            if not(self.documentation):
+            if not self.documentation:
                 b.volume        = contract.parameters.get("volume")
+                b.min_volume    = contract.parameters.get("min_volume", b.volume)
+                b.max_volume    = contract.parameters.get("max_volume", b.volume)
                 """ Physical flow of product to contract: """ 
                 b.shipment = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, min(b.volume, b.offtaker_capacity)))
                 if b.is_spot_contract == False:
                     # Bookkeeping of contract status and whether obligations are met.
-                    b.contract_status = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.volume))
-                    b.contract_shortfall = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.volume))
-                    b.contract_slack = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.volume)) # Slack variable. Excess shipments are not awarded.
-            else:
+                    b.contract_status = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.max_volume))
+                    b.contract_shortfall = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.min_volume))
+                    b.contract_slack = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.max_volume)) # Slack variable. Excess shipments are not awarded.
+            else: # Not compatible with min and max volume contracts.
                 b.volume = pyo.Var(domain=pyo.Reals)
+                b.min_volume    = contract.parameters.get("min_volume", b.volume)
+                b.max_volume    = contract.parameters.get("max_volume", b.volume)
                 b.volume_constraint = pyo.Constraint(expr= b.volume == contract.parameters.get("volume"))
                 """ Physical flow of product to contract: """ 
                 b.shipment = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.offtaker_capacity))
@@ -233,42 +280,45 @@ class HourlyDeterministicLPModel:
                     b.contract_slack_bounds = pyo.Constraint(self.model.T, rule=lambda m, t: b.contract_slack[t] <= b.volume)
         self.model.contractBlocks = pyo.Block(self.model.contracts, rule=contractBlock_rule)
 
+    def _get_datetime_infos(self, inst, t:int):
+        """ Helper method to determine whether it is shipment or deadline time for contracts. """
+        if t == -1:
+            dt_t = inst.T_datetime[t+1].value - pd.Timedelta(1, 'h')
+        else:
+            dt_t = inst.T_datetime[t].value
+        is_day_end = (dt_t.hour == 23)
+        is_month_end = dt_t.is_month_end
+        if isinstance(is_month_end, list) or (is_month_end and dt_t.month == 1):
+            if isinstance(is_month_end, list):
+                is_month_end = is_month_end[0]
+        is_year_end = dt_t.is_year_end
+        if isinstance(is_year_end, list):
+            is_year_end = is_year_end[0]
+        return is_day_end, is_month_end, is_year_end
+    
+    def _is_target_time(self, inst, b:pyo.Block, t:int):
+        """ Helper method to determine whether it is deadline time for contracts. """
+        assert (b.target_frequency in self.frequency_options), f"{b.target_frequency} for {b._name} is not in options.\nOptions are {self.frequency_options}."
+        is_day_end, is_month_end, is_year_end = self._get_datetime_infos(inst, t)
+        is_planning_end = (t == (self.planning_horizon - 1))
+        return bool((b.target_frequency == 'hourly') or                                  # If we have an hourly contract.
+                    (b.target_frequency == 'daily'   and is_day_end) or                  # If we have a daily contract and it is end-of-day (EOD).
+                    (b.target_frequency == 'monthly' and is_month_end and is_day_end) or # If we have a monthly contract and it is end-of-month and EOD.
+                    (b.target_frequency == 'yearly'  and is_year_end and is_day_end) or  # If we have a yearly contract and it is end-of-year and EOD.
+                    (b.target_frequency == 'planning_horizon' and is_planning_end))      # If we are constraining the problem on the planning horizon.
+    
+    def _is_shipment_time(self, inst, b:pyo.Block, t:int):
+        """ Helper method to determine whether it is shipment time for contracts. """
+        assert (b.shipment_frequency in self.frequency_options), f"{b.shipment_frequency} for {b._name} is not in options.\nOptions are {self.frequency_options}."
+        is_day_end, is_month_end, is_year_end = self._get_datetime_infos(inst, t)
+        return bool((b.shipment_frequency == 'hourly') or                                   # If we have an hourly shipment.
+                    (b.shipment_frequency == 'daily'   and is_day_end) or                   # If we have a daily shipment and it is end-of-day (EOD).
+                    (b.shipment_frequency == 'monthly' and is_month_end and is_day_end) or  # If we have a monthly shipment and it is end-of-month and EOD.
+                    (b.shipment_frequency == 'yearly'  and is_year_end and is_day_end))     # If we have a yearly shipment and it is end-of-year and EOD.
+
     def _build_concrete_instance(self, data=None):
         self.inst = self.model.create_instance(data=data)
         self.updated_constraints = []
-
-        """ Helper methods to determine whether it is shipment or target time for contracts. """
-        def _get_datetime_infos(inst, t):
-            if t == -1:
-                dt_t = inst.T_datetime[t+1].value - pd.Timedelta(1, 'h')
-            else:
-                dt_t = inst.T_datetime[t].value
-            is_day_end = (dt_t.hour == 23)
-            is_month_end = dt_t.is_month_end
-            if isinstance(is_month_end, list):
-                is_month_end = is_month_end[0]
-            is_year_end = dt_t.is_year_end
-            if isinstance(is_year_end, list):
-                is_year_end = is_year_end[0]
-            return is_day_end, is_month_end, is_year_end
-        
-        def _is_target_time(inst, b, t):
-            assert (b.target_frequency in self.frequency_options), f"{b.target_frequency} for {b._name} is not in options.\nOptions are {self.frequency_options}."
-            is_day_end, is_month_end, is_year_end = _get_datetime_infos(inst, t)
-            is_planning_end = (t == (self.planning_horizon - 1))
-            return bool((b.target_frequency == 'hourly') or                                  # If we have an hourly contract.
-                        (b.target_frequency == 'daily'   and is_day_end) or                  # If we have a daily contract and it is end-of-day (EOD).
-                        (b.target_frequency == 'monthly' and is_month_end and is_day_end) or # If we have a monthly contract and it is end-of-month and EOD.
-                        (b.target_frequency == 'yearly'  and is_year_end and is_day_end) or  # If we have a yearly contract and it is end-of-year and EOD.
-                        (b.target_frequency == 'planning_horizon' and is_planning_end))      # If we are constraining the problem on the planning horizon.
-        
-        def _is_shipment_time(inst, b, t):
-            assert (b.shipment_frequency in self.frequency_options), f"{b.shipment_frequency} for {b._name} is not in options.\nOptions are {self.frequency_options}."
-            is_day_end, is_month_end, is_year_end = _get_datetime_infos(inst, t)
-            return bool((b.shipment_frequency == 'hourly') or                                   # If we have an hourly shipment.
-                        (b.shipment_frequency == 'daily'   and is_day_end) or                   # If we have a daily shipment and it is end-of-day (EOD).
-                        (b.shipment_frequency == 'monthly' and is_month_end and is_day_end) or  # If we have a monthly shipment and it is end-of-month and EOD.
-                        (b.shipment_frequency == 'yearly'  and is_year_end and is_day_end))     # If we have a yearly shipment and it is end-of-year and EOD.
 
         """ If we are guiding the model with planning targets for contracts, this logic should be added to the contractBlocks """
         if self.guideline == 'hourly_target':
@@ -326,10 +376,30 @@ class HourlyDeterministicLPModel:
             return b.in_flow[t] == sum(inst.contractBlocks[cont].shipment[t] for cont in b.contracts)
         self.inst.offtake_constraint = pyo.Constraint(self.inst.offtakers, self.inst.T, rule=offtake_rule)
 
+        if self.inflexible: # Link ramping constraints.
+            self.inst.ramping_constraints = []
+            def ramp_up_rule(inst, link, t):
+                b = inst.linkBlocks[link]
+                if b.max_ramp_up >= b.in_capacity: # If max ramp up is larger than capacity, then we can ramp up from zero to full in one step, so we don't need to add a constraint.
+                    return pyo.Constraint.Skip
+                else:
+                    prev_setpoint = b.in_flow[t-1] if t > 0 else self.inst.prev_link_setpoints[link] * b.in_capacity
+                    return b.in_flow[t] - prev_setpoint <= b.max_ramp_up
+            def ramp_down_rule(inst, link, t):
+                b = inst.linkBlocks[link]
+                if b.max_ramp_down >= b.in_capacity: # If max ramp down is larger than capacity, then we can ramp down from full to zero in one step, so we don't need to add a constraint.
+                    return pyo.Constraint.Skip
+                else:
+                    prev_setpoint = b.in_flow[t-1] if t > 0 else self.inst.prev_link_setpoints[link] * b.in_capacity
+                    return prev_setpoint - b.in_flow[t] <= b.max_ramp_down
+            self.inst.ramp_up_constraint = pyo.Constraint(self.inst.links, self.inst.T, rule=ramp_up_rule)
+            self.inst.ramp_down_constraint = pyo.Constraint(self.inst.links, self.inst.T, rule=ramp_down_rule)
+            self.updated_constraints += ["ramp_up_constraint", "ramp_down_constraint"]
+
         """ Rules that keeps track of delivery to contracts. """
         def contract_shipment_rule(inst, cont, t): # Ensure that the shipments happen only at shipment time.
             b = inst.contractBlocks[cont]
-            if _is_shipment_time(inst, b, t):
+            if self._is_shipment_time(inst, b, t) or (t==0 and b.is_spot_contract and pyo.value(inst.spot_shipment) == 1):
                 return pyo.Constraint.Skip # Then don't constrain the shipment more than its existing bounds.
             else:
                 return b.shipment[t] == 0 # Otherwise there cannot be any sales for this contract for this hour.
@@ -340,7 +410,7 @@ class HourlyDeterministicLPModel:
             if b.is_spot_contract:
                 return pyo.Constraint.Skip
             else:
-                if _is_target_time(inst, b, t-1):
+                if self._is_target_time(inst, b, t-1):
                     return b.contract_status[t] == b.shipment[t] # If we had deadline in the previous hour, then the status is reset.
                 else:
                     prev_status = inst.init_contract_status[cont] if t == 0 else b.contract_status[t-1]
@@ -352,8 +422,8 @@ class HourlyDeterministicLPModel:
             if b.is_spot_contract:
                 return pyo.Constraint.Skip
             else:
-                if _is_target_time(inst, b, t):
-                    return b.contract_shortfall[t] - b.contract_slack[t] == b.volume - b.contract_status[t] # At contract deadline we can have non-zero contract_shortfall.
+                if self._is_target_time(inst, b, t):
+                    return b.contract_shortfall[t] - b.contract_slack[t] == b.min_volume - b.contract_status[t] # At contract deadline we can have non-zero contract_shortfall.
                 else:
                     return b.contract_shortfall[t] + b.contract_slack[t] == 0 # Otherwise there cannot be any shortfall.
         self.inst.shortfall_constraint = pyo.Constraint(self.inst.contracts, self.inst.T, rule=contract_shortfall_rule)
@@ -397,26 +467,47 @@ class HourlyDeterministicLPModel:
         # We assume now that there is only one price realization of day-ahead markets. Could be generalized if we also want to buy from neighbouring bidding zones.
         return sum(inst.dayaheadBlocks[dayahead].out_flow[t] * inst.electricity_price[t] for t in inst.T for dayahead in inst.dayaheads)
 
-    def _set_objective(self):
-        def cashflow_rule(inst):
-            """ Revenues of the RFP (contract payments happen when shipments happen) """
-            revenue = sum(b.shipment[t] * b.price for name, b in inst.contractBlocks.items() for t in inst.T)
+    def _cashflow_rule(self, inst):
+        """ Revenues of the RFP (contract payments happen when shipments happen) """
+        revenue = sum(b.shipment[t] * b.price for name, b in inst.contractBlocks.items() for t in inst.T)
 
-            """ Costs of the RFP (PPA costs not included as they are exogenously fixed) """
-            costs = self._get_electricity_objective_cost(inst)
+        """ Costs of the RFP (PPA costs not included as they are exogenously fixed) """
+        costs = self._get_electricity_objective_cost(inst)
 
-            for cont in inst.contracts: # Penalties of not meeting contract obligations:
-                b = inst.contractBlocks[cont]
-                if b.is_spot_contract == False:
-                    costs += sum(b.contract_shortfall[t] * b.penalty for t in inst.T)
-            
-            """ Maximize profits """
-            return revenue - costs
+        for cont in inst.contracts: # Penalties of not meeting contract obligations:
+            b = inst.contractBlocks[cont]
+            if b.is_spot_contract == False:
+                costs += sum(b.contract_shortfall[t] * b.penalty for t in inst.T)
         
+        """ Maximize profits """
+        return revenue - costs
+
+    def _set_objective(self):        
         def production_value_rule(inst):
-            production_value = sum(inst.linkBlocks[link].out_flow[t] * inst.production_value[link] for link in inst.links for t in inst.T)
-            remove_shipment_revenue_incentive = sum(b.shipment[t] * (0.95 * b.price) for name, b in inst.contractBlocks.items() for t in inst.T)
-            return production_value - remove_shipment_revenue_incentive
+            # First remove considered revenue from shipments.
+            value_stream = -sum(b.shipment[t] * b.price for name, b in inst.contractBlocks.items() for t in inst.T if b.carrier_in == "ammonia")
+
+            ammonia_shipment_schedule = [self._is_shipment_time(inst, b, t) for name, b in inst.contractBlocks.items() if (b.carrier_in == "ammonia" and not b.is_spot_contract) for t in inst.T]
+            shipment_times = [t+1 for t, is_shipment in enumerate(ammonia_shipment_schedule) if is_shipment]
+            if len(shipment_times) > 0:
+                valorized_by_shipment = [1] * max(shipment_times) + [0] * (len(ammonia_shipment_schedule) - max(shipment_times))
+            else:
+                valorized_by_shipment = [0] * len(ammonia_shipment_schedule)
+            if pyo.value(inst.spot_shipment) == 1:
+                valorized_by_shipment[0] = 1 # If we have a spot shipment, then we consider the production in the first hour to be valorized by the shipment.
+            value_stream += sum(sum(inst.linkBlocks[link].out_flow[t] * inst.production_value[link] * (1 - valorized_by_shipment[t]) 
+                                   for link in inst.links) + 
+                                   sum(b.shipment[t] * inst.shipment_value[name] * valorized_by_shipment[t] 
+                                       for name, b in inst.contractBlocks.items() if b.carrier_in == "ammonia")
+                                   for t in inst.T)
+            
+            # production_value = sum(inst.linkBlocks[link].out_flow[t] * inst.production_value[link] for link in inst.links for t in inst.T)
+            # remove_shipment_revenue_incentive = sum(b.shipment[t] * (0.95 * b.price) for name, b in inst.contractBlocks.items() for t in inst.T)
+            # return production_value - remove_shipment_revenue_incentive
+            return value_stream
+            # remove_shipment_revenue_incentive = sum(b.shipment[t] * (1 * b.price) for name, b in inst.contractBlocks.items() for t in inst.T)
+            # storage_cost = sum(b.soc[self.decision_horizon-1] for name, b in inst.storageBlocks.items())
+            # return production_value - remove_shipment_revenue_incentive - storage_cost
         
         def state_value_rule(inst):
             storage_value = sum(b.soc[self.decision_horizon-1] * inst.storage_value[name] for name, b in inst.storageBlocks.items())
@@ -424,7 +515,9 @@ class HourlyDeterministicLPModel:
             return storage_value + contract_value
         
         def objective_rule(inst):
-            obj = cashflow_rule(inst)
+            obj = self._cashflow_rule(inst)
+            # Penalize storage ever so slightly - relates to opportunity cost of missing future storage space
+            obj -= sum(b.soc[t]*0.001 for name, b in self.inst.storageBlocks.items() for t in self.inst.T)
             if self.guideline == 'production_value':
                 obj += production_value_rule(inst)
             if self.objective_logic == 'value_maximization':
@@ -437,6 +530,12 @@ class HourlyDeterministicLPModel:
 
     def run(self, verbose=False):
         if self.inst:
+            self.inst.componentBlocks = {**self.inst.storageBlocks, 
+                                         **self.inst.dayaheadBlocks, 
+                                         **self.inst.linkBlocks, 
+                                         **self.inst.offtakerBlocks, 
+                                         **self.inst.ppaBlocks, 
+                                         **self.inst.contractBlocks}
             self.solve_message = None
             if self.uses_persistent_solver:
                 self.solve_message = self.solver.solve(tee=verbose)
@@ -545,7 +644,8 @@ class HourlyStochasticLPModel(HourlyDeterministicLPModel):
     shifts and stochasticities. """
     def __init__(self,
                  rfp: RenewableFuelPlant,
-                 planning_horizon: int,
+                 inflexible: bool = False,
+                 planning_horizon: int = 24,
                  decision_horizon: int = 24,
                  solver: str = 'scip',
                  allow_spot_buy: bool = True,
@@ -553,7 +653,7 @@ class HourlyStochasticLPModel(HourlyDeterministicLPModel):
                  n_scenarios: int = 3,
                  **kwargs,
                  ):
-        super().__init__(rfp, planning_horizon, decision_horizon, solver, allow_spot_buy, guideline)
+        super().__init__(rfp, inflexible, planning_horizon, decision_horizon, solver, allow_spot_buy, guideline)
         self.n_scenarios = n_scenarios
     
     def initialize_model(self):
@@ -584,8 +684,9 @@ class HourlyStochasticLPModel(HourlyDeterministicLPModel):
 
 class ShieldLPModel(HourlyDeterministicLPModel):
     """ Class which minimizes the L2 distance from exogenously decided actions, respecting the feasible space of the problem. """
-    def __init__(self, env, rfp, planning_horizon = 24, decision_horizon = 24, solver = 'scip', allow_spot_buy = True, penalty_type="L1"):
+    def __init__(self, env, rfp, inflexible = False, planning_horizon = 24, decision_horizon = 24, solver = 'scip', allow_spot_buy = True, penalty_type="L1"):
         super().__init__(rfp=rfp,
+                         inflexible=inflexible,
                          planning_horizon=planning_horizon,
                          decision_horizon=decision_horizon,
                          solver=solver,
@@ -636,14 +737,233 @@ class ShieldLPModel(HourlyDeterministicLPModel):
         self.inst.objective = pyo.Objective(rule=objective_rule_shield, sense=pyo.minimize)
 
 
+class AggregativeModel(HourlyDeterministicLPModel):
+    def __init__(self,
+                 rfp: RenewableFuelPlant,
+                 inflexible: bool = False,
+                 planning_horizon: int = 4*24,
+                 decision_horizon: int = 24,
+                 solver: str = 'scip',
+                 allow_spot_buy: bool = True,
+                 guideline: str|None = None,
+                 objective_logic: str|None = None,
+                 documentation: bool = False,
+                 **kwargs,
+                 ):
+        super().__init__(rfp, inflexible, planning_horizon, decision_horizon, solver, allow_spot_buy, guideline, objective_logic, documentation, **kwargs)
+        self.planning_horizon += 1 # We add an extra time index to aggregate the flows of the rest of the year.
+    
+    def _build_abstract_model(self):
+        super()._build_abstract_model()
+
+        """ The last time index is the one aggregating the flows of the rest of the year. """
+        self.model.longterm_price = pyo.Param(within=pyo.Reals, default=0, mutable=True)
+        self.model.longterm_cfs = pyo.Param(self.model.ppas, within=pyo.NonNegativeReals, default=0, mutable=True)
+        self.model.offtaker_availabilities = pyo.Param(self.model.offtakers, within=pyo.NonNegativeIntegers, default=0, mutable=True)
+        self.model.contract_deadlines = pyo.Param(self.model.contracts, within=pyo.NonNegativeIntegers, default=0, mutable=True)
+        self.model.longterm_horizon = pyo.Param(within=pyo.NonNegativeIntegers, default=0, mutable=True)
+    
+    def _build_concrete_instance(self, data=None):
+        """ In concrete instance change (for the last time index representing the aggregate horizon):
+            Carrier block: Nothing
+            Storage block: Nothing
+            PPA block: Change out_flow upper bound to be equal to hours_remaining * capacity
+                        and redefine the ppa_procurement_rule.
+            Dayahead block: Change out_flow bounds to scale with hours_remaining.
+            Link block: Change upper bounds of in_flow, out_flow, and elec_cons of links to scale with hours_remaining.
+                        If inflexible, remove the final ramping constraints.
+            Offtaker block: Change upper bound of in_flow and elec_cons to scale with number of hours where the offtaker is available in the longterm.
+            Contract block: Scale shipment upper bound with number of hours where the offtaker is available in the longterm
+                            and remove 0 constraint if this is non-zero.
+            Scale contract_shortfall, contract_slack, and contract_status upper bound with number of contract deadlines in the aggregate horizon.
+            The contracted volume, b.volume, is similarly different for the aggregate time step. Change the constraint there.
+        """
+        self.inst = self.model.create_instance(data=data)
+        self.updated_constraints = []
+
+        """ Rules that define the physical reality of the renewable fuel plant. """
+        def carrier_balance_rule(inst, carr, t): # Ensure balance equations of plant energy carriers.
+            b = inst.carrierBlocks[carr]
+            for name, comp in self.rfp.get_components().items():
+                if comp.parameters.get("produces") == b.type:
+                    if comp.is_link:
+                        b._in[t].append(inst.linkBlocks[name].out_flow[t])
+                    elif comp.is_storage:
+                        b._in[t].append(inst.storageBlocks[name].out_flow[t])
+                    elif comp.is_ppa:
+                        b._in[t].append(inst.ppaBlocks[name].out_flow[t])
+                    elif comp.is_dayahead:
+                        b._in[t].append(inst.dayaheadBlocks[name].out_flow[t])
+                if comp.parameters.get("consumes") == b.type:
+                    if comp.is_link:
+                        b._out[t].append(inst.linkBlocks[name].in_flow[t])
+                    elif comp.is_storage:
+                        b._out[t].append(inst.storageBlocks[name].in_flow[t])
+                    elif comp.is_offtaker:
+                        b._out[t].append(inst.offtakerBlocks[name].in_flow[t])
+                if b.type == "plant_electricity":
+                    if comp.parameters.get("electricity_consumption", 0) > 0:
+                        if comp.is_link:
+                            b._out[t].append(inst.linkBlocks[name].elec_cons[t]) # Using a link can consume electricity.
+                        elif comp.is_storage:
+                            b._out[t].append(inst.storageBlocks[name].elec_cons[t]) # Charging a storage can consume electricity.
+                        elif comp.is_offtaker:
+                            b._out[t].append(inst.offtakerBlocks[name].elec_cons[t]) # Using an offtaker can consume electricity.
+            return sum(b._in[t]) == sum(b._out[t]) # Carrier balance arcs
+        self.inst.carrier_balance_constraint = pyo.Constraint(self.inst.carriers, self.inst.T, rule=carrier_balance_rule)
+
+        """ Update bounds of aggregate time step: """
+        LH = self.inst.longterm_horizon
+        aggr_ix = self.planning_horizon - 1
+        self.inst.electricity_price[aggr_ix] = self.inst.longterm_price
+        for dayahead in self.inst.dayaheads:
+            b = self.inst.dayaheadBlocks[dayahead]
+            b.out_flow[aggr_ix].bounds = (-b.capacity * LH, b.capacity * self.allow_spot_buy * LH)
+        for ppa in self.inst.ppas:
+            b = self.inst.ppaBlocks[ppa]
+            b.out_flow[aggr_ix].setub(b.capacity * LH)
+        for lin in self.inst.links:
+            link = self.rfp.get_component(lin)
+            b = self.inst.linkBlocks[lin]
+            b.in_flow[aggr_ix].bounds = (b.min_load * b.in_capacity * LH, b.in_capacity * LH)
+            b.out_flow[aggr_ix].bounds = (b.min_load * b.capacity * LH, b.capacity * LH)
+            if b.ec > 0:
+                b.elec_cons[aggr_ix].setub(b.capacity * b.ec * LH)
+            if pyo.value(LH) == 0 and self.inflexible and bool(link.parameters.get('efficiency_curve', 0)):
+                # Remove efficiency curve constraint:
+                for seg in self.inst.linkBlocks["Electrolyzer"].segments:
+                    b.ec_constraints[aggr_ix, seg].deactivate()
+        for offtaker in self.inst.offtakers:
+            b = self.inst.offtakerBlocks[offtaker]
+            OA = self.inst.offtaker_availabilities[offtaker]
+            b.in_flow[aggr_ix].setub(b.capacity * OA)
+            if b.ec > 0:
+                b.elec_cons[aggr_ix].setub(b.capacity * b.ec * OA)
+        for contract in self.inst.contracts:
+            b = self.inst.contractBlocks[contract]
+            OA = self.inst.offtaker_availabilities[b.offtaker]
+            CD = self.inst.contract_deadlines[contract]
+            b.shipment[aggr_ix].setub(min(b.volume * pyo.value(CD), b.offtaker_capacity * pyo.value(OA)))
+            if b.is_spot_contract == False:
+                b.contract_status[aggr_ix].setub(b.volume * CD)
+                b.contract_shortfall[aggr_ix].setub(b.volume * CD)
+                b.contract_slack[aggr_ix].setub(b.volume * CD)
+
+        def ppa_procurement_rule(inst, ppa, t): # Constrain supply flows from PPAs.
+            b = inst.ppaBlocks[ppa]
+            if t == aggr_ix: # If we are at the last time index, which is the aggregate one, then we constrain the out_flow to be equal to the longterm_cfs * capacity, which is the long-term expected production from the PPA.
+                return b.out_flow[t] == inst.longterm_cfs[ppa] * b.capacity * LH
+            return b.out_flow[t] == inst.supplier_cf[ppa, t] * b.capacity
+        self.inst.ppa_procurement_constraint = pyo.Constraint(self.inst.ppas, self.inst.T, rule=ppa_procurement_rule)
+
+        def soc_rule(inst, stor, t): # Define intertemporal SOC logic
+            b = inst.storageBlocks[stor]
+            if t == 0: # The initial SOC is externally given.
+                return b.soc[0] == inst.init_soc[stor] + b.in_flow[0] - b.out_flow[0]
+            else:
+                return b.soc[t] == b.soc[t-1] + b.in_flow[t] - b.out_flow[t]
+        self.inst.soc_constraint = pyo.Constraint(self.inst.storages, self.inst.T, rule=soc_rule)
+
+        def offtake_rule(inst, offt, t): # Ensure that offtake is matched to sale flows and that offtake stream does not violate capacity.
+            b = inst.offtakerBlocks[offt]
+            return b.in_flow[t] == sum(inst.contractBlocks[cont].shipment[t] for cont in b.contracts)
+        self.inst.offtake_constraint = pyo.Constraint(self.inst.offtakers, self.inst.T, rule=offtake_rule)
+
+        if self.inflexible: # Link ramping constraints.
+            self.inst.ramping_constraints = []
+            def ramp_up_rule(inst, link, t):
+                b = inst.linkBlocks[link]
+                if b.max_ramp_up >= b.in_capacity or t == aggr_ix: # If max ramp up is larger than capacity, then we can ramp up from zero to full in one step, so we don't need to add a constraint.
+                    return pyo.Constraint.Skip
+                else:
+                    prev_setpoint = b.in_flow[t-1] if t > 0 else self.inst.prev_link_setpoints[link] * b.in_capacity
+                    return b.in_flow[t] - prev_setpoint <= b.max_ramp_up
+            def ramp_down_rule(inst, link, t):
+                b = inst.linkBlocks[link]
+                if b.max_ramp_down >= b.in_capacity or t == aggr_ix: # If max ramp down is larger than capacity, then we can ramp down from full to zero in one step, so we don't need to add a constraint.
+                    return pyo.Constraint.Skip
+                else:
+                    prev_setpoint = b.in_flow[t-1] if t > 0 else self.inst.prev_link_setpoints[link] * b.in_capacity
+                    return prev_setpoint - b.in_flow[t] <= b.max_ramp_down
+            self.inst.ramp_up_constraint = pyo.Constraint(self.inst.links, self.inst.T, rule=ramp_up_rule)
+            self.inst.ramp_down_constraint = pyo.Constraint(self.inst.links, self.inst.T, rule=ramp_down_rule)
+            self.updated_constraints += ["ramp_up_constraint", "ramp_down_constraint"]
+
+        """ Rules that keeps track of delivery to contracts. """
+        def contract_shipment_rule(inst, cont, t): # Ensure that the shipments happen only at shipment time.
+            b = inst.contractBlocks[cont]
+             # If we are at the shipment time, or if we are at the aggregate time step and the offtaker is available in the long-term, then allow shipments.
+            if self._is_shipment_time(inst, b, t) or (t == aggr_ix and pyo.value(inst.offtaker_availabilities[b.offtaker]) > 0):
+                return pyo.Constraint.Skip # Then don't constrain the shipment more than its existing bounds.
+            else:
+                return b.shipment[t] == 0 # Otherwise there cannot be any sales for this contract for this hour.
+        self.inst.shipment_constraint = pyo.Constraint(self.inst.contracts, self.inst.T, rule=contract_shipment_rule)
+
+        def contract_status_rule(inst, cont, t): # The shipments gets added to the contract_status.
+            b = inst.contractBlocks[cont]
+            if b.is_spot_contract:
+                return pyo.Constraint.Skip
+            else:
+                if self._is_target_time(inst, b, t-1):
+                    return b.contract_status[t] == b.shipment[t] # If we had deadline in the previous hour, then the status is reset.
+                else:
+                    prev_status = inst.init_contract_status[cont] if t == 0 else b.contract_status[t-1]
+                    return b.contract_status[t] == prev_status + b.shipment[t] # Otherwise we increment by shipment size.
+        self.inst.status_constraint = pyo.Constraint(self.inst.contracts, self.inst.T, rule=contract_status_rule)
+
+        def contract_shortfall_rule(inst, cont, t): # At contract delivery time, calculate shortfall.
+            b = inst.contractBlocks[cont]
+            if b.is_spot_contract:
+                return pyo.Constraint.Skip
+            else:
+                vol = b.volume
+                CD = inst.contract_deadlines[cont]
+                if t == aggr_ix:
+                    vol = vol * CD
+                if self._is_target_time(inst, b, t) or (t == aggr_ix and pyo.value(CD) > 0):
+                    return b.contract_shortfall[t] - b.contract_slack[t] == vol - b.contract_status[t] # At contract deadline we can have non-zero contract_shortfall.
+                else:
+                    return b.contract_shortfall[t] + b.contract_slack[t] == 0 # Otherwise there cannot be any shortfall.
+        self.inst.shortfall_constraint = pyo.Constraint(self.inst.contracts, self.inst.T, rule=contract_shortfall_rule)
+
+        self._set_objective()
+
+        self.inst.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+        self.updated_constraints += ["ppa_procurement_constraint", "soc_constraint", "status_constraint", "shipment_constraint", "shortfall_constraint"]
+
+    def _cashflow_rule(self, inst):
+        aggr_ix = self.planning_horizon - 1
+        discount = lambda t: (1-0.01 * (t==aggr_ix)) # Discount factor for the aggregate time step, to avoid overvaluing it compared to the hourly time steps.
+        """ Revenues of the RFP (contract payments happen when shipments happen) """
+        revenue = sum(b.shipment[t] * b.price * discount(t) for name, b in inst.contractBlocks.items() for t in inst.T)
+
+        """ Costs of the RFP (PPA costs not included as they are exogenously fixed) """
+        costs = self._get_electricity_objective_cost(inst)
+
+        for cont in inst.contracts: # Penalties of not meeting contract obligations:
+            b = inst.contractBlocks[cont]
+            if b.is_spot_contract == False:
+                costs += sum(b.contract_shortfall[t] * b.penalty for t in inst.T)
+        
+        """ Maximize profits """
+        return revenue - costs
+
+    def _set_objective(self):        
+        def objective_rule(inst):
+            obj = self._cashflow_rule(inst)
+            # Penalize storage ever so slightly - relates to opportunity cost of missing future storage space
+            obj -= sum(b.soc[t]*0.001 for name, b in self.inst.storageBlocks.items() for t in self.inst.T)
+            return obj
+
+        self.inst.objective = pyo.Objective(rule=objective_rule, sense=pyo.maximize)
+
+
 class HourlyRecourseModel(HourlyDeterministicLPModel):
     """ If we have cleared power setpoints for our day-ahead market clearing (testing a bidding curve model)
         We can make all the plant flow decisions here as recourse decisions. Balancing electricity is simply just punished at +/- 30%
         """
-    def initialize_model(self):
-        # Initialize the optimization model
-        self.model = pyo.AbstractModel()
-        self._build_abstract_model()
+    def _build_abstract_model(self):
+        super()._build_abstract_model()
         self.model.cleared_power = pyo.Param(self.model.T, within=pyo.Reals, default=0, mutable=True)
         self.model.fixed_da = pyo.Param(self.model.T, within=pyo.Binary, default=0, mutable=True) # Whether we should fix the DA decision to cleared_power parameter.
         if hasattr(self.model, 'dayaheadBlocks'):
@@ -663,9 +983,6 @@ class HourlyRecourseModel(HourlyDeterministicLPModel):
                 return b.out_flow[t] == b.da_buy[t] + b.ba_buy[t] - b.ba_sell[t]
             b.balancing_constraint = pyo.Constraint(self.model.T, rule=balancing_rule)
         self.model.dayaheadBlocks = pyo.Block(self.model.dayaheads, rule=dayaheadBlock_rule)
-        if self.uses_persistent_solver:
-            self._build_concrete_instance() # Creates self.inst
-            self.solver.set_instance(self.inst)
     
     def _build_concrete_instance(self, data=None):
         super()._build_concrete_instance(data)
@@ -712,8 +1029,9 @@ class HourlyRecourseModel(HourlyDeterministicLPModel):
 
 class ShieldRecourseModel(HourlyRecourseModel):
     """ Class which minimizes the L2 distance from exogenously decided actions, respecting the feasible space of the problem. """
-    def __init__(self, env, rfp, planning_horizon = 24, decision_horizon = 24, solver = 'scip', allow_spot_buy = True, penalty_type="L1"):
+    def __init__(self, env, rfp, inflexible = False, planning_horizon = 24, decision_horizon = 24, solver = 'scip', allow_spot_buy = True, penalty_type="L1"):
         super().__init__(rfp=rfp,
+                         inflexible=inflexible,
                          planning_horizon=planning_horizon,
                          decision_horizon=decision_horizon,
                          solver=solver,
@@ -777,27 +1095,26 @@ class DecisionRuleModel(HourlyRecourseModel):
         """
     def __init__(self,
                  rfp,
-                 planning_horizon,
-                 decision_horizon = 24,
-                 solver = 'scip',
-                 allow_spot_buy = True,
+                 inflexible: bool = False,
+                 planning_horizon: int = 24,
+                 decision_horizon: int = 24,
+                 solver: str = 'scip',
+                 allow_spot_buy: bool = True,
                  guideline = None,
                  objective_logic = None,
-                 n_features=4,
-                 n_price_domains=1,
+                 n_features: int = 4,
+                 n_price_domains: int = 1,
                  domain_prices=[],
                  **kwargs):
-        super().__init__(rfp, planning_horizon, decision_horizon, solver, allow_spot_buy, guideline, objective_logic, **kwargs)
+        super().__init__(rfp, inflexible, planning_horizon, decision_horizon, solver, allow_spot_buy, guideline, objective_logic, **kwargs)
         self.n_features = n_features # If 4, then it is: ["Bias", "Forecast Price", "Realized PPA Power", "Realized Price"]
         self.n_rules = 24 # One linear decision rule for each hour.
         self.n_price_domains = n_price_domains
         self.domain_prices = np.asarray(domain_prices)
         assert len(domain_prices)+1 == n_price_domains
 
-    def initialize_model(self):
-        # Initialize the optimization model
-        self.model = pyo.AbstractModel()
-        self._build_abstract_model()
+    def _build_abstract_model(self):
+        super()._build_abstract_model()
         self.model.features      = pyo.RangeSet(0, self.n_features - 1)
         self.model.feature_hours = pyo.RangeSet(0, self.n_rules - 1)
         self.model.price_domains = pyo.RangeSet(0, self.n_price_domains - 1)
@@ -830,10 +1147,6 @@ class DecisionRuleModel(HourlyRecourseModel):
                 return b.linear_weights[_pd, self.model.features.at(-1), h] <= 0
             b.non_decreasing_bid_constraint = pyo.Constraint(self.model.price_domains, self.model.feature_hours, rule=non_decreasing_bid_rule)
         self.model.dayaheadBlocks = pyo.Block(self.model.dayaheads, rule=dayaheadBlock_rule)
-        
-        if self.uses_persistent_solver:
-            self._build_concrete_instance() # Creates self.inst
-            self.solver.set_instance(self.inst)
 
     def _build_concrete_instance(self, data=None):
         super()._build_concrete_instance(data)
@@ -863,21 +1176,6 @@ class DecisionRuleModel(HourlyRecourseModel):
                 return high_price_domain_buy <= low_price_domain_buy # ensure that what we bid to buy in the high price domain is lower than in the low price domain.
         self.inst.price_domain_constraint = pyo.Constraint(self.inst.dayaheads, self.inst.price_domains, self.inst.T, rule=price_domain_rule)
         
-        # def positive_exceedance_rule(inst, da, t):
-        #     b = inst.dayaheadBlocks[da]
-        #     ppa_power = sum(inst.ppaBlocks[ppa].out_flow[t] for ppa in inst.ppas)
-        #     gcp_cap = inst.linkBlocks["Grid Connection Point"].capacity/inst.linkBlocks["Grid Connection Point"].rate
-        #     power_buy_cap = gcp_cap - ppa_power
-        #     return b.da_positive_exceedance[t] >= b.da_buy[t] - power_buy_cap
-        # self.inst.positive_exceedance_constraint = pyo.Constraint(self.inst.dayaheads, self.inst.T, rule=positive_exceedance_rule)
-        
-        # def negative_exceedance_rule(inst, da, t):
-        #     b = inst.dayaheadBlocks[da]
-        #     ppa_power = sum(inst.ppaBlocks[ppa].out_flow[t] for ppa in inst.ppas)
-        #     power_sell_cap = ppa_power
-        #     return b.da_negative_exceedance[t] >= -b.da_buy[t] - power_sell_cap
-        # self.inst.negative_exceedance_constraint = pyo.Constraint(self.inst.dayaheads, self.inst.T, rule=negative_exceedance_rule)
-        
         self.updated_constraints += ["linear_mapping_constraint", "price_domain_constraint"]
     
     def get_weights(self):
@@ -902,7 +1200,8 @@ class StochasticRecourseModel(HourlyRecourseModel):
 
     def __init__(self,
                  rfp: RenewableFuelPlant,
-                 planning_horizon: int,
+                 inflexible: bool = False,
+                 planning_horizon: int = 24,
                  decision_horizon: int = 24,
                  fixed_horizon: int = 12,
                  solver: str = 'scip',
@@ -912,18 +1211,10 @@ class StochasticRecourseModel(HourlyRecourseModel):
                  model_type = "non-recourse DA",
                  **kwargs,
                  ):
-        super().__init__(rfp, planning_horizon, decision_horizon, solver, allow_spot_buy, guideline)
+        super().__init__(rfp, inflexible, planning_horizon, decision_horizon, solver, allow_spot_buy, guideline)
         self.fixed_horizon = fixed_horizon
         self.n_scenarios = n_scenarios
         self.model_type = model_type
-
-    def initialize_model(self):
-        # Initialize the optimization model
-        self.model = pyo.AbstractModel()
-        self._build_abstract_model()
-        if self.uses_persistent_solver:
-            self._build_concrete_instance() # Creates self.inst
-            self.solver.set_instance(self.inst)
 
     def _build_abstract_model(self):
         # Model Time Sets:
@@ -950,10 +1241,10 @@ class StochasticRecourseModel(HourlyRecourseModel):
         self.model.supplier_cf        = pyo.Param(self.model.ppas, self.model.S, self.model.T, within=pyo.NonNegativeReals, default=1, mutable=True)
         self.model.init_contract_status         = pyo.Param(self.model.contracts, within=pyo.NonNegativeReals, default=0, mutable=True)
         self.model.electricity_price            = pyo.Param(self.model.S, self.model.T, within=pyo.Reals, default=50, mutable=True)
+        self.model.prev_link_setpoints          = pyo.Param(self.model.links, within=pyo.NonNegativeReals, default=0.5, mutable=True)
 
         self.model.cleared_power = pyo.Param(self.model.T, within=pyo.Reals, default=0, mutable=True)
         self.model.fixed_da = pyo.Param(self.model.T, within=pyo.Binary, default=0, mutable=True) # Whether we should fix the DA decision to cleared_power parameter.
-        # self.model.offtaker_availability        = pyo.Param(self.model.offtakers, self.model.T, within=pyo.Binary, default=1, mutable=True)
 
         # Guideline related mutable parameters:
         if self.guideline == "production_value": # Specified value of outflow of links.
@@ -1047,22 +1338,54 @@ class StochasticRecourseModel(HourlyRecourseModel):
             link            = self.rfp.get_component(lin)
             b._name         = link.name
             b.rate          = link.parameters.get("rate", 1)
+            assert b.rate > 0, f"Link {b._name} has non-positive conversion rate, which is not supported in the current model formulation."
             b.capacity      = link.parameters.get('capacity', np.inf)
             b.ec            = link.parameters.get("electricity_consumption", 0) # Electricity consumption rate
             b.carrier_in    = str(link.parameters["consumes"])
             b.carrier_out   = str(link.parameters["produces"])
-            b.in_flow       = pyo.Var(self.model.S, self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.capacity/b.rate))
-            b.out_flow      = pyo.Var(self.model.S, self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.capacity))
-            if b.ec > 0:
+            b.in_capacity   = b.capacity / b.rate
+            b.max_ramp_up   = link.parameters.get('max_ramp_up', 1) * b.in_capacity
+            b.max_ramp_down = link.parameters.get('max_ramp_down', 1) * b.in_capacity
+
+            b.min_load      = link.parameters.get('min_load', 0) * self.inflexible # If inflexible, we set min_load to the given value. If flexible, we set min_load to 0, which means that the flow can be reduced to 0 if desired.
+            b.in_flow       = pyo.Var(self.model.S, self.model.T, domain=pyo.NonNegativeReals, bounds=(b.min_load*b.in_capacity, b.in_capacity))
+            b.out_flow      = pyo.Var(self.model.S, self.model.T, domain=pyo.NonNegativeReals, bounds=(b.min_load*b.capacity, b.capacity))
+
+            def conversion_rule(m, s, t):
+                return b.out_flow[s,t] == b.rate * b.in_flow[s,t]
+            b.conversion_constraint = pyo.Constraint(self.model.S, self.model.T, rule=conversion_rule)
+            if self.inflexible and bool(link.parameters.get('efficiency_curve', 0)):
+                ec_rule = lambda m, s, t, segment: pyo.Constraint.Skip
+                b.max_electricity_consumption = None
+                slope = None
+                if b._name == "Electrolyzer":
+                    # Implement piecewise linear efficiency curve.
+                    data = pd.read_json("setup_files/" + link.parameters['efficiency_curve'], orient="index")
+                    slope = np.asarray(data.loc['a'].values[0])
+                    intercept = np.asarray(data.loc['b'].values[0])
+                    # Slope and intercept relate y = b * Capacity + a * x, where x is power (MW) and y is mass outflow (kg/h)
+                    b.max_electricity_consumption = b.capacity / (slope[-1] + intercept[-1]) * 1000
+                    def ec_rule(m, s, t, segment):
+                        return b.out_flow[s, t] <= (slope[segment] * b.elec_cons[s, t] + intercept[segment] * b.max_electricity_consumption) / 1000
+                elif b._name == "Haber Bosch Plant":
+                    # Implement piecewise linear efficiency curve.
+                    data = pd.read_excel("setup_files/" + link.parameters['efficiency_curve'], sheet_name="Piecewise")
+                    data = data.dropna(how="all")
+                    slope = np.asarray(data['a'].values)
+                    intercept = np.asarray(data['b'].values)
+                    b.max_electrical_consumption = b.capacity * (intercept[-1] + slope[-1])
+                    def ec_rule(m, s, t, segment):
+                        return b.elec_cons[s, t] >= slope[segment] * b.out_flow[s, t] + intercept[segment] * b.capacity
+                b.segments = pyo.RangeSet(0, len(slope)-1)
+                b.elec_cons = pyo.Var(self.model.S, self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.max_electricity_consumption))
+                b.ec_constraints = pyo.Constraint(self.model.S, self.model.T, b.segments, rule=ec_rule)
+            elif b.ec > 0:
                 b.elec_cons = pyo.Var(self.model.S, self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.capacity * b.ec))
                 def ec_rule(m, s, t):
                     return b.elec_cons[s,t] == b.ec * b.out_flow[s,t]
                 b.ec_constraint = pyo.Constraint(self.model.S, self.model.T, rule=ec_rule)
-            def conversion_rule(m, s, t):
-                return b.out_flow[s,t] == b.rate * b.in_flow[s,t]
-            b.conversion_constraint = pyo.Constraint(self.model.S, self.model.T, rule=conversion_rule)
             if self.model_type == "non_recourse flows":
-                b.main_in_flow = pyo.Var(self.model.T_fix_recourse, domain=pyo.NonNegativeReals, bounds=(0, b.capacity/b.rate))
+                b.main_in_flow = pyo.Var(self.model.T_fix_recourse, domain=pyo.NonNegativeReals, bounds=(0, b.in_capacity))
                 def main_in_flow_rule(m, s, t):
                     return b.main_in_flow[t] == b.in_flow[s,t]
                 b.main_in_flow_constraint = pyo.Constraint(self.model.S, self.model.T_fix_recourse, rule=main_in_flow_rule)
@@ -1120,39 +1443,6 @@ class StochasticRecourseModel(HourlyRecourseModel):
         self.inst = self.model.create_instance(data=data)
         self.updated_constraints = []
 
-        """ Helper methods to determine whether it is shipment or target time for contracts. """
-        def _get_datetime_infos(inst, t):
-            if t == -1:
-                dt_t = inst.T_datetime[t+1].value - pd.Timedelta(1, 'h')
-            else:
-                dt_t = inst.T_datetime[t].value
-            is_day_end = (dt_t.hour == 23)
-            is_month_end = dt_t.is_month_end
-            if isinstance(is_month_end, list):
-                is_month_end = is_month_end[0]
-            is_year_end = dt_t.is_year_end
-            if isinstance(is_year_end, list):
-                is_year_end = is_year_end[0]
-            return is_day_end, is_month_end, is_year_end
-        
-        def _is_target_time(inst, b, t):
-            assert (b.target_frequency in self.frequency_options), f"{b.target_frequency} for {b._name} is not in options.\nOptions are {self.frequency_options}."
-            is_day_end, is_month_end, is_year_end = _get_datetime_infos(inst, t)
-            is_planning_end = (t == (self.planning_horizon - 1))
-            return bool((b.target_frequency == 'hourly') or                                  # If we have an hourly contract.
-                        (b.target_frequency == 'daily'   and is_day_end) or                  # If we have a daily contract and it is end-of-day (EOD).
-                        (b.target_frequency == 'monthly' and is_month_end and is_day_end) or # If we have a monthly contract and it is end-of-month and EOD.
-                        (b.target_frequency == 'yearly'  and is_year_end and is_day_end) or  # If we have a yearly contract and it is end-of-year and EOD.
-                        (b.target_frequency == 'planning_horizon' and is_planning_end))      # If we are constraining the problem on the planning horizon.
-        
-        def _is_shipment_time(inst, b, t):
-            assert (b.shipment_frequency in self.frequency_options), f"{b.shipment_frequency} for {b._name} is not in options.\nOptions are {self.frequency_options}."
-            is_day_end, is_month_end, is_year_end = _get_datetime_infos(inst, t)
-            return bool((b.shipment_frequency == 'hourly') or                                   # If we have an hourly shipment.
-                        (b.shipment_frequency == 'daily'   and is_day_end) or                   # If we have a daily shipment and it is end-of-day (EOD).
-                        (b.shipment_frequency == 'monthly' and is_month_end and is_day_end) or  # If we have a monthly shipment and it is end-of-month and EOD.
-                        (b.shipment_frequency == 'yearly'  and is_year_end and is_day_end))     # If we have a yearly shipment and it is end-of-year and EOD.
-
         """ If we are guiding the model with planning targets for contracts, this logic should be added to the contractBlocks """
         if self.guideline == 'hourly_target':
             def hourly_target_rule(inst, s, t): # Fix hourly production of ammonia:
@@ -1209,10 +1499,30 @@ class StochasticRecourseModel(HourlyRecourseModel):
             return b.in_flow[s,t] == sum(inst.contractBlocks[cont].shipment[s,t] for cont in b.contracts)
         self.inst.offtake_constraint = pyo.Constraint(self.inst.offtakers, self.inst.S, self.inst.T, rule=offtake_rule)
 
+        if self.inflexible: # Link ramping constraints.
+            self.inst.ramping_constraints = []
+            def ramp_up_rule(inst, link, s, t):
+                b = inst.linkBlocks[link]
+                if b.max_ramp_up >= b.in_capacity: # If max ramp up is larger than capacity, then we can ramp up from zero to full in one step, so we don't need to add a constraint.
+                    return pyo.Constraint.Skip
+                else:
+                    prev_setpoint = b.in_flow[s,t-1] if t > 0 else self.inst.prev_link_setpoints[link] * b.in_capacity
+                    return b.in_flow[s,t] - prev_setpoint <= b.max_ramp_up
+            def ramp_down_rule(inst, link, s, t):
+                b = inst.linkBlocks[link]
+                if b.max_ramp_down >= b.in_capacity: # If max ramp down is larger than capacity, then we can ramp down from full to zero in one step, so we don't need to add a constraint.
+                    return pyo.Constraint.Skip
+                else:
+                    prev_setpoint = b.in_flow[s,t-1] if t > 0 else self.inst.prev_link_setpoints[link] * b.in_capacity
+                    return prev_setpoint - b.in_flow[s,t] <= b.max_ramp_down
+            self.inst.ramp_up_constraint = pyo.Constraint(self.inst.links, self.inst.S, self.inst.T, rule=ramp_up_rule)
+            self.inst.ramp_down_constraint = pyo.Constraint(self.inst.links, self.inst.S, self.inst.T, rule=ramp_down_rule)
+            self.updated_constraints += ["ramp_up_constraint", "ramp_down_constraint"]
+
         """ Rules that keeps track of delivery to contracts. """
         def contract_shipment_rule(inst, cont, s, t): # Ensure that the shipments happen only at shipment time.
             b = inst.contractBlocks[cont]
-            if _is_shipment_time(inst, b, t):
+            if self._is_shipment_time(inst, b, t):
                 return pyo.Constraint.Skip # Then don't constrain the shipment more than its existing bounds.
             else:
                 return b.shipment[s,t] == 0 # Otherwise there cannot be any sales for this contract for this hour.
@@ -1223,7 +1533,7 @@ class StochasticRecourseModel(HourlyRecourseModel):
             if b.is_spot_contract:
                 return pyo.Constraint.Skip
             else:
-                if _is_target_time(inst, b, t-1):
+                if self._is_target_time(inst, b, t-1):
                     return b.contract_status[s,t] == b.shipment[s,t] # If we had deadline in the previous hour, then the status is reset.
                 else:
                     prev_status = inst.init_contract_status[cont] if t == 0 else b.contract_status[s,t-1]
@@ -1235,7 +1545,7 @@ class StochasticRecourseModel(HourlyRecourseModel):
             if b.is_spot_contract:
                 return pyo.Constraint.Skip
             else:
-                if _is_target_time(inst, b, t):
+                if self._is_target_time(inst, b, t):
                     return b.contract_shortfall[s,t] - b.contract_slack[s,t] == b.volume - b.contract_status[s,t] # At contract deadline we can have non-zero contract_shortfall.
                 else:
                     return b.contract_shortfall[s,t] + b.contract_slack[s,t] == 0 # Otherwise there cannot be any shortfall.
@@ -1261,6 +1571,7 @@ class StochasticRecourseModel(HourlyRecourseModel):
             def bid_ordering_rule(inst, prev_s, s, t):
                 return inst.dayaheadBlocks["ElectricitySpot"].da_buy[prev_s, t] >= inst.dayaheadBlocks["ElectricitySpot"].da_buy[s, t]
             self.inst.bid_ordering_constraint = pyo.Constraint(self.inst.ORDERING_PAIRS, rule=bid_ordering_rule)
+            self.updated_constraints += ["bid_ordering_constraint"]
 
             def fix_da_rule(inst, da, s, t):
                 if pyo.value(inst.fixed_da[t]) == 1:
@@ -1296,22 +1607,22 @@ class StochasticRecourseModel(HourlyRecourseModel):
                                     for t in inst.T for dayahead in inst.dayaheads) * inst.weights[s] for s in inst.S)
         return balancing_cost + dayahead_cost
 
-    def _set_objective(self):
-        def cashflow_rule(inst):
-            """ Revenues of the RFP (contract payments happen when shipments happen) """
-            revenue = sum(sum(b.shipment[s,t] * b.price for name, b in inst.contractBlocks.items() for t in inst.T) * inst.weights[s] for s in inst.S)
+    def _cashflow_rule(self, inst):
+        """ Revenues of the RFP (contract payments happen when shipments happen) """
+        revenue = sum(sum(b.shipment[s,t] * b.price for name, b in inst.contractBlocks.items() for t in inst.T) * inst.weights[s] for s in inst.S)
 
-            """ Costs of the RFP (PPA costs not included as they are exogenously fixed) """
-            costs = self._get_electricity_objective_cost(inst)
+        """ Costs of the RFP (PPA costs not included as they are exogenously fixed) """
+        costs = self._get_electricity_objective_cost(inst)
 
-            for cont in inst.contracts: # Penalties of not meeting contract obligations:
-                b = inst.contractBlocks[cont]
-                if b.is_spot_contract == False:
-                    costs += sum(sum(b.contract_shortfall[s,t] * b.penalty for t in inst.T) * inst.weights[s] for s in inst.S)
-            
-            """ Maximize profits """
-            return revenue - costs
+        for cont in inst.contracts: # Penalties of not meeting contract obligations:
+            b = inst.contractBlocks[cont]
+            if b.is_spot_contract == False:
+                costs += sum(sum(b.contract_shortfall[s,t] * b.penalty for t in inst.T) * inst.weights[s] for s in inst.S)
         
+        """ Maximize profits """
+        return revenue - costs
+
+    def _set_objective(self):        
         def production_value_rule(inst):
             production_value = sum(sum(inst.linkBlocks[link].out_flow[s,t] * inst.production_value[link] for link in inst.links for t in inst.T) * inst.weights[s] for s in inst.S)
             remove_shipment_revenue_incentive = sum(sum(b.shipment[s,t] * (0.95 * b.price) for name, b in inst.contractBlocks.items() for t in inst.T) * inst.weights[s] for s in inst.S)
@@ -1323,7 +1634,7 @@ class StochasticRecourseModel(HourlyRecourseModel):
             return storage_value + contract_value
 
         def objective_rule(inst):
-            obj = cashflow_rule(inst)
+            obj = self._cashflow_rule(inst)
             if self.guideline == 'production_value':
                 obj += production_value_rule(inst)
             if self.objective_logic == 'value_maximization':
@@ -1427,5 +1738,4 @@ class StochasticRecourseModel(HourlyRecourseModel):
                 return df
             else:
                 return None
-
 

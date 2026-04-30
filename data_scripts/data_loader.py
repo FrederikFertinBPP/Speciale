@@ -9,7 +9,7 @@ from astral import LocationInfo
 from astral.sun import sun
 import matplotlib.pyplot as plt
 
-# Token for ENTSO-E Transparency Platform: ea0b03ee-267d-4a52-b1c6-15ed7d94b79a
+# Token for ENTSO-E Transparency Platform: 134329c1-a120-4b33-8fa1-c96e9b46af59
 
 class DataLoader:
     time_columns = ['is_weekend', 'is_winter', 'is_summer', 'is_spring', 'is_autumn', 'is_day']
@@ -75,22 +75,24 @@ class DataLoader:
 class HistoricalData(DataLoader):
     # Define API endpoint and parameters
     URL = "https://api.energidataservice.dk/dataset/"
-    ENTSOE_TOKEN = '39306393-0570-4890-8253-8f407431f951'
+    ENTSOE_TOKEN = '134329c1-a120-4b33-8fa1-c96e9b46af59'
 
     def __init__(self,
-                 start      :pd.Timestamp,
-                 end        :pd.Timestamp,
-                 priceArea  :list           = [""],
-                 limit      :int            = 1000000,
-                 country_code    :str       = "PT",
-                 server     :str            = "ENTSOE",
+                 start:pd.Timestamp,
+                 end:pd.Timestamp,
+                 priceArea:list     = [""],
+                 limit:int          = 1000000,
+                 country_code:str   = "PT",
+                 server:str         = "ENTSOE",
+                 load_data:bool     = True,
                  ):
         self.filepath = 'historical_data/clean_dataframes/' +'server-' + server + 'country-' + country_code + "_".join(priceArea) + str(start).split(' ')[0] + 'to' + str(end).split(' ')[0] + '.csv'
         self.country = country_code
         self.start, self.end = start, end
         self.server, self.limit, self.priceArea = server, limit, priceArea
-        self.load_capacity_data()
-        self.get_price_and_generation_data()
+        if load_data:
+            self.load_capacity_data()
+            self.get_price_and_generation_data()
     
     def get_price_and_generation_data(self):
         # Load generation and price data
@@ -114,13 +116,13 @@ class HistoricalData(DataLoader):
             else:
                 raise(KeyError("Data server/source not known."))
             # self.data = self.data.drop(self.data.loc[self.data.isna().any(axis=1)].index)
-            # self.data = self._fill_missing_hours(self.data)
+            # self.data = self._fill_missing_generation_hours(self.data)
             self.data.to_csv(self.filepath, index=True)
         self.data = self._create_seasonal_features(df=self.data[['price', 'wind', 'solar']], prod_columns=['wind', 'solar'])
         self.data['log_wind'] = log_transform(self.data['wind'])
         self.data['log_solar'] = log_transform(self.data['solar'])
 
-    def load_capacity_data(self):
+    def load_capacity_data(self, filepath='historical_data/wind_solar_capacity_PT.csv'):
         # Taken from ENTSO-E Transparency Platform (does not match generation data):
         # directory = 'historical_data'
         # file = self.country + '_installed_capacities.csv'
@@ -133,7 +135,7 @@ class HistoricalData(DataLoader):
         # years = [int(y.split(" ")[0]) for y in solar_caps.columns[1:]]
         # self.caps = pd.DataFrame(index=years,
         #                          data={'wind' : w_c.astype(float), 'solar' : s_c.astype(float)})
-        df = pd.read_csv('historical_data/wind_solar_capacity_PT.csv')
+        df = pd.read_csv(filepath)
         df.index = [pd.Period(df['Year'].iloc[q].astype(str) + '-' + df["Month"].iloc[q].astype(str)) for q in range(len(df))]
         df.columns = ["Year", "Month", "wind", "solar"]
         self.caps = df[['wind', 'solar']]
@@ -154,17 +156,48 @@ class HistoricalData(DataLoader):
     def get_data_from_entsoe(self):
         self.client = EntsoePandasClient(api_key=self.ENTSOE_TOKEN) # Object to query data through
 
-        df_prices   = self.client.query_day_ahead_prices(country_code=self.country,start=self.start,end=self.end-pd.Timedelta(1, 'h'))
-        df = pd.DataFrame(index = pd.to_datetime(df_prices.index, utc=True))
-        df['price'] = df_prices
+        # Load Price Data
+        df_prices   = self.client.query_day_ahead_prices(country_code=self.country,start=self.start,end=self.end+pd.Timedelta(23, 'h'))
+        df_prices   = df_prices.loc[df_prices.index.minute==0]
+        df_id       = self.client.query_imbalance_prices(country_code="PT",start=self.start,end=self.end+pd.Timedelta(24, 'h'))
+        df_id       = df_id.loc[df_id.index.minute==0]
 
-        df_generation = self.client.query_generation(country_code=self.country, start=self.start, end=self.end)
+        self.client.query_intraday_prices(country_code=self.country,start=self.end,end=self.end+pd.Timedelta(23, 'h'), sequence=1)
+        
+        # Load Capacity Data
+        # df_capacity = self.client.query_installed_generation_capacity()
+        # df_capacity = self.client.query_installed_generation_capacity(country_code=self.country,start=self.start,end=self.end+pd.Timedelta(24, 'h'))
+        # df_capacity_per_unit = self.client.query_installed_generation_capacity_per_unit(country_code=self.country,start=self.start,end=self.end+pd.Timedelta(24, 'h'))
+        self.client.query_offered_capacity()
+
+        # Load Load Data
+        df_load = self.client.query_load_and_forecast(country_code=self.country,start=self.start,end=self.end+pd.Timedelta(24, 'h'))
+        df_load = self._fill_missing_generation_hours(df_load)
+
+        # Load Generation Data
+        df_generation = self.client.query_generation(country_code=self.country, start=self.start, end=self.end+pd.Timedelta(24, 'h'))
         df_generation = df_generation.fillna(0)
         df_generation.index = pd.to_datetime(df_generation.index, utc=True)
-        df_generation = self._fill_missing_hours(df_generation)
+        df_generation = self._fill_missing_generation_hours(df_generation)
+        
+        # Create Combined Dataframe
+        df = pd.DataFrame(index = pd.to_datetime(df_prices.index, utc=True))
+        df['price'] = df_prices
+        df = self._fill_missing_price_hours(df)
+        
         _sub_index  = 'Actual Aggregated'
         df.loc[df.index.isin(df_generation.index), 'solar'] = df_generation[('Solar',_sub_index)]
         df.loc[df.index.isin(df_generation.index), 'wind']  = df_generation[('Wind Onshore',_sub_index)] + (df_generation[('Wind Offshore',_sub_index)] if 'Wind Offshore' in df_generation.columns else 0)
+
+        df[df_load.columns] = df_load.copy()
+        df["Residual Load"] = df["Actual Load"] - df["solar"] - df["wind"]
+
+        id_columns = [f"Imbalance {col}" for col in df_id.columns]
+        df[id_columns] = df_id.copy()
+        missing_imbalances = df.isna().max(axis=1)
+        da_prices_corresponding = df.loc[missing_imbalances, 'price'].values
+        df.loc[missing_imbalances, id_columns] = np.transpose([da_prices_corresponding]*2)
+        
         return df
 
     def _get_response(self, url):
@@ -176,7 +209,7 @@ class HistoricalData(DataLoader):
         df['HourUTC'] = pd.to_datetime(df['HourUTC'])
         return df
     
-    def _fill_missing_hours(self, df):
+    def _fill_missing_generation_hours(self, df):
         all_hours = df.index
         all_consecutive_hours = pd.date_range(start=df.index[0], end=df.index[-1], freq='h')
         missing_hours = sorted(set(all_consecutive_hours) - set(all_hours))
@@ -185,7 +218,16 @@ class HistoricalData(DataLoader):
             row = df.loc[df.index == copied_hour]
             row.index = [hour]
             df = pd.concat([df.loc[df.index < hour], row, df.loc[df.index > hour]])
-        return df  
+        return df
+    
+    def _fill_missing_price_hours(self, df):
+        missing_hours = sorted(set(df.loc[df.isna().any(axis=1)].index))
+        for hour in missing_hours:
+            copied_hour = hour - pd.Timedelta(1, 'day')
+            row = df.loc[df.index == copied_hour]
+            row.index = [hour]
+            df = pd.concat([df.loc[df.index < hour], row, df.loc[df.index > hour]])
+        return df
 
     def _load_electricity_data(self):
         url = self.URL + "Elspotprices"
@@ -203,8 +245,8 @@ class HistoricalData(DataLoader):
         df = df[['HourUTC','ForecastType','ForecastCurrent','ForecastDayAhead']]
         wind = df.loc[df['ForecastType'] == 'Offshore Wind']
         solar = df.loc[df['ForecastType'] == 'Solar']
-        wind = self._fill_missing_hours(wind) # Fill in hours of missing data
-        solar = self._fill_missing_hours(solar)
+        wind = self._fill_missing_generation_hours(wind) # Fill in hours of missing data
+        solar = self._fill_missing_generation_hours(solar)
         return wind, solar
 
 

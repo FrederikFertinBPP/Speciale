@@ -45,12 +45,14 @@ def get_hindsight_solution(trajectory, stats, rfp, model_class=HourlyDeterminist
         electricity_price += list(trajectory.env_info[t]['electricity_price'])
 
     horizon = horizon_days * 24
-    allow_spot_buy = bool(stats["high"][0][0] > 0)
+    allow_spot_buy = stats.get("allow_spot_buy", True)
+    inflexible = stats.get("inflexible", False)
     pfm = model_class(rfp,
                         planning_horizon=horizon,
                         decision_horizon=horizon,
                         solver='gurobi',
                         allow_spot_buy=allow_spot_buy,
+                        inflexible=inflexible,
                         )
     pfm.initialize_model()
     wind_cf = {('WindPower', t): wind_profile[t] for t in range(horizon)}
@@ -228,7 +230,7 @@ def print_trajectory_summary(trajectory, stats, rfp, model_class = HourlyDetermi
     print("Contracted annual ammonia:\t\t", round(contract_target), "t NH3")
     prod_ammonia1 = trajectory.state[-1]['state']['contracts'][1] * (contract_target if normalized else 1)
     print("Annual production intended for contract:", round(prod_ammonia1), "t NH3")
-    contract_shortfall  = prod_ammonia1 - contract_target
+    contract_shortfall = prod_ammonia1 - contract_target
     print("Deviation from required annual amount:\t", round(contract_shortfall), "t NH3")
     print("Achieved contract revenues:\t", contracted_revenue)
     print("Received penalties:\t", contract_penalties)
@@ -274,7 +276,7 @@ def print_trajectory_summary(trajectory, stats, rfp, model_class = HourlyDetermi
 
 
 if __name__ == '__main__':
-    documentation = False
+    documentation = False # "Backcasting"
     single_experiment_evaluation = False
     document_optimal_strategy = False
 
@@ -301,12 +303,22 @@ if __name__ == '__main__':
     # experiments = ("test_RecourseAgent5_production_value_ph_96_spot_True",
     #                "test_RecourseAgent5_DAbidding_production_value_ph_96_spot_True",
     #             )
+    experiments = ("minload_pwl_ramp_DeterministicHA_hourly_target_ph_96_spot_True_small",
+                   "minload_pwl_ramp_DeterministicHA_production_value_ph_96_spot_True_small",
+                   "test_RecedingHorizonAgent_ph_96_spot_True_small",
+                   "test_AggregateFullHorizonAgent_ph_96_spot_True_small")
+    experiments = ("test_contract_DeterministicHA_production_value_ph_96_spot_True_small",)
+    experiments = ("backcasting_DeterministicHA_production_value_ph_96_spot_True_small",
+                   "backcasting_AggregateFullHorizonAgent_ph_96_spot_True_small",
+                   "backcasting_prophet_DeterministicHA_production_value_ph_96_spot_True_small",
+                   "backcasting_persistence_DeterministicHA_production_value_ph_96_spot_True_small",)
+    # experiments = ("test_StrikePriceBiddingAgent1_SP1_production_value_ph_96_spot_True_small",)
     #### We assess the regret of the model:
     # This is the difference in profits between the actions chosen by the agent and the optimal actions
     # chosen by an oracle: A perfect foresight model for the full year.
     # Just load the realized wind, solar, and prices (can be found in trajectory env info)
     # and solve an LP for the full year.
-    rfp = create_rfp()
+    rfp = create_rfp(layout_file = "rfp_layout - resized.xlsx")
 
     #%% Trajectory stats:
     if single_experiment_evaluation:
@@ -350,31 +362,39 @@ if __name__ == '__main__':
                     opt_model, trajectory_summary, emissions_summary, capture_price_summary, ppa_capacity_factor = print_trajectory_summary(trajectory=trajectories[ix], stats=stats[ix], rfp=rfp)
                     opt_models.append(opt_model)
                     if documentation:
+                        if not os.path.exists(f"documentation/{documentation}"):
+                            os.makedirs(f"documentation/{documentation}")
                         prices = [p.value for p in opt_model.inst.electricity_price.values()]
                         imports = list(opt_model.decision_results.link_production["Grid Connection Point"])
                         fig, ax = plt.subplots(figsize=(12,8))
                         plt.scatter(prices, imports, s=2)
                         plt.xlabel("Prices [€/MWh]")
                         plt.ylabel("Net Power Consumption [MW]")
-                        plt.savefig(f"documentation/PerfectForesightStrategy/scatter_{ix}.png")
-                        plt.show()
+                        plt.savefig(f"documentation/{documentation}/scatter_{exp_ix}.png")
+                        plt.close()
                         ss = [[p,i] for p,i in zip(prices, imports)]
+                        max_import = max(imports)
+                        min_import = min(imports)
                         sort_ss = sorted(ss) # Sort by prices, index 0
                         data = np.asarray(sort_ss)
                         fig, ax = plt.subplots(figsize=(12,8))
-                        for ix, datapoint in enumerate(data):
-                            color= "steelblue" if datapoint[1]>1 else "lightgrey"
-                            plt.bar(ix, datapoint[0], width=0.1, color=color, edgecolor=color)
-                        plt.bar(0,0, width=0.1, color="steelblue", label="Consuming")
-                        plt.bar(0,0, width=0.1, color="lightgrey", label="Not Consuming")
+                        for jx, datapoint in enumerate(data):
+                            plt.bar(jx, datapoint[0] * datapoint[1]/max_import, width=0.1, color="steelblue", edgecolor="steelblue")
+                            plt.bar(jx, datapoint[0], width=0.1, color="lightgrey", edgecolor="lightgrey")
+                        # plt.bar(0,0, width=0.1, color="steelblue", label="Consuming")
+                        # plt.bar(0,0, width=0.1, color="lightgrey", label="Not Consuming")
+                        plt.plot(data[:,0], label="100% load", linestyle="-",alpha=0.5, color='black')
+                        plt.plot(data[:,0] * 0.9, label="90% load", linestyle="-.",alpha=0.5, color='black')
+                        plt.plot(data[:,0] * 0.5, label="50% load", linestyle=":",alpha=0.5, color='black')
+                        plt.plot(data[:,0] * min_import/max_import, label="Min. load", linestyle="--",alpha=0.5, color='black')
                         plt.xlabel("Sorted hours")
                         plt.ylabel("Electricity Price [€/MWh]")
-                        plt.legend()
-                        plt.savefig(f"documentation/PerfectForesightStrategy/duration_curve_{ix}.png")
-                        plt.show()
+                        plt.legend(loc="upper left")
+                        plt.savefig(f"documentation/{documentation}/duration_curve_{exp_ix}.png")
+                        plt.close()
                 else:
                     _, trajectory_summary, emissions_summary, capture_price_summary, ppa_capacity_factor = print_trajectory_summary(trajectory=trajectories[ix], stats=stats[ix], rfp=rfp, opt_model=opt_models[ix])
-                print(f"{experiment_name}'s trajectory number {ix} done")
+                
                 trajectory_summaries.append(trajectory_summary)
                 emissions_summaries.append(emissions_summary)
                 capture_price_summaries.append(capture_price_summary)

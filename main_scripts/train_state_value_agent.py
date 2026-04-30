@@ -9,7 +9,7 @@ import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 
 from common_scripts import train # stats, trajectories = train(env, agent, num_episodes=n_episodes, verbose=True, seed=42)
-from model_scripts.environment import RFPEnv, get_env
+from model_scripts.environment import RFPModelActionsEnv, get_env
 from model_scripts.agent_hierarchical_rl import StateValueHA
 
 def main():
@@ -27,7 +27,8 @@ def main():
     ### Set experiment name and length ###
     experiment_name = "trainStateValueHA" + guideline + objective_logic
     
-    env = get_env(RFPEnv, allow_spot_buy=True, balancing_market=False, verbose=True, load_data=True)
+    env_config = {"allow_spot_buy": True, "balancing_market": False, "verbose": True, "load_data": True, "inflexible": False}
+    env = get_env(RFPModelActionsEnv, env_config=env_config, layout_file="rfp_layout - resized.xlsx")
 
     epsilon = lambda steps, episodes: max(0.05, 1 - 2 * np.sqrt(steps) / 100)  # Epsilon decay function
     writer = SummaryWriter(f'runs/{experiment_name}')

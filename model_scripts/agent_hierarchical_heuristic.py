@@ -5,9 +5,9 @@ import os
 from common_scripts.utils import set_plotting_style
 set_plotting_style()
 
-from model_scripts.hourly_models import HourlyDeterministicLPModel, HourlyStochasticLPModel
+from model_scripts.hourly_models import HourlyDeterministicLPModel, HourlyStochasticLPModel, AggregativeModel
 from common_scripts import Agent, cache_write
-from model_scripts.environment import RFPShieldEnv, RFPEnv
+from model_scripts.environment import RFPShieldEnv, RFPModelActionsEnv
 
 
 class HierarchicalAgent(Agent):
@@ -19,7 +19,7 @@ class HierarchicalAgent(Agent):
                  *args,
                  writer=None,
                  planning_horizon:int = 4*24,
-                 guideline:str|None = "production_value",
+                 guideline:str|None = None,
                  hourly_model_class=HourlyDeterministicLPModel,
                  solver='gurobi',
                  documentation=False,
@@ -37,6 +37,7 @@ class HierarchicalAgent(Agent):
 
         if hourly_model_class is not None:
             self.hourly_model = hourly_model_class(rfp = self.env.rfp,
+                                                inflexible = self.env.inflexible,
                                                 planning_horizon = self.planning_horizon,
                                                 decision_horizon = self.decision_horizon,
                                                 solver = solver,
@@ -47,6 +48,22 @@ class HierarchicalAgent(Agent):
                                                 )
             self.hourly_model.initialize_model()
         self.logbook = {}
+
+    def _get_availability(self, frequency, hourly_index):
+        """ Binary vector of availabilities. """
+        H = len(hourly_index)
+        a = np.zeros(H)
+        for t in range(H):
+            time_stamp = hourly_index[t]
+            if frequency=='hourly':
+                a[t] = 1
+            if frequency=='daily':
+                a[t] = int(time_stamp.hour == 23)
+            if frequency=='monthly':
+                a[t] = int(time_stamp.is_month_end and time_stamp.hour == 23)
+            if frequency=='yearly':
+                a[t] = int(time_stamp.is_year_end and time_stamp.hour == 23)
+        return a
 
     def _get_supplier_cf(self, obs, forecast):
         wind_profile    = self.env.wind_mapper(forecast['wind'])
@@ -64,16 +81,71 @@ class HierarchicalAgent(Agent):
             supplier_cf = {**supplier_cf, **{(ppa_name, t): forecast_profile[t] for t in range(self.planning_horizon)}}
         return supplier_cf
     
-    def _get_forecasts_and_electricity(self, t):
+    def _get_forecasts_and_electricity(self, time, info):
         # Forecast prices and renewables for the planning horizon
-        if self.env.load_data:
-            timestamp_str = t.strftime("%Y%m%d")
+        is_backcasting = bool(info.get("forecast_path", False))
+        if is_backcasting:
+            timestamp_str = time.strftime("%Y-%m-%d")
+            forecasts = [pd.read_csv(info["forecast_path"] + f"forecast_{timestamp_str}.csv", index_col=0)]
+        elif self.env.load_data:
+            timestamp_str = time.strftime("%Y%m%d")
             forecasts = [pd.read_csv(f"{self.env.scenario_path}forecast_{timestamp_str}_0.csv")]
         else:
-            forecasts = self.env.forecaster.forecast(start=t, end=t+pd.Timedelta(self.planning_horizon-1, 'h'), n_forecasts=1) # list of DFs
+            forecasts = self.env.forecaster.forecast(start=time, end=time+pd.Timedelta(self.planning_horizon-1, 'h'), n_forecasts=1) # list of DFs
         # Scenario dependent electricity price forecasts:
         electricity_price_forecast = {t: forecasts[0].iloc[t]['price'] for t in range(self.planning_horizon)}
         return forecasts, electricity_price_forecast
+
+    def _construct_concrete_data(self, obs, time):
+        """ Creates time, state, and steering signal of data object. """
+        time_index = pd.to_datetime(pd.date_range(time, time+pd.Timedelta(self.planning_horizon-1,'h'),freq='h'), utc=True)
+        datetime_data = {t: time_index[t] for t in range(self.planning_horizon)}
+
+        soc = dict(zip(self.env.storage_names, obs['state']['storages']))
+        for key, val in soc.items():
+            if val<0 and abs(val) < self.error_margin:
+                soc[key] = 0
+        contract_status = dict(zip(self.env.contract_names, obs['state']['contracts']))
+        for key, val in contract_status.items():
+            if val<0 and abs(val) < self.error_margin:
+                contract_status[key] = 0
+        # offtaker_availability = {(self.env.offtaker_names[ix], t) : obs['context']['offtakers'][t,ix]
+        #                          for ix in range(len(self.env.offtaker_names)) for t in range(self.planning_horizon)}
+
+        steering = None
+        if self.guideline == 'production_value':
+            steering = {'Haber Bosch Plant': self.ammonia_strike_price}
+        elif self.guideline == 'hourly_target':
+            steering = {None: self.ammonia_hourly_target}
+        
+        data = { # Set up the necessary data for the LP Concrete Model
+            None: {
+                'T_datetime': datetime_data, 
+                'init_soc': soc,
+                'init_contract_status' : contract_status,
+                # 'offtaker_availability': offtaker_availability,
+                self.guideline: steering,
+            }
+        }
+        return data
+
+    def _run_hourly_model(self, obs, time, info, data):
+        def _run_model(data=data):
+            self.hourly_model.build_concrete_instance(data=data)
+            self.hourly_model.run(verbose=False)
+            return self.hourly_model.get_actions()
+
+        actions = _run_model(data=data)
+        if actions is not None:
+            return actions
+        else:
+            data[None]["spot_shipment"] = {None: 1} # If it was infeasible, try to allow an extraordinary spot shipment.
+            actions = _run_model(data=data)
+            if actions is not None:
+                return actions
+            else:
+                self._save_obs_for_debug(obs, info)
+                raise ValueError(f"Could not get actions.\nTime: {time}.\nState at termination: {obs['state']}.") 
 
     def _save_obs_for_debug(self, obs, info):
         debug_info = {**obs, **info}
@@ -83,7 +155,7 @@ class HierarchicalAgent(Agent):
     def _update_logbook(self):
         """ Function to update the logbook of the hierarchical agent. See extra stats for purpose. """
         pass
-
+    
     def extra_stats(self):
         """ Called by training algorithm to log agent stats about the experiments. """
         return self.logbook
@@ -120,7 +192,10 @@ class DeterministicHA(HierarchicalAgent):
 
         # Internal value of ammonia production for Ammonia1 contract.
         self.ammonia_spot_price = self.env.rfp.get_contract("AmmoniaSpot").parameters.get("price")
-        self.ammonia_strike_price = self.env.rfp.get_contract('Ammonia1').parameters.get('price', 1000) # €/tNH3
+        self.ammonia_contract_price = self.env.rfp.get_contract('Ammonia1').parameters.get('price', 1000) # €/tNH3
+        self.ammonia_strike_price = self.ammonia_contract_price
+        self.ammonia_max_value = self.env.rfp.get_contract('Ammonia1').parameters.get('penalty', 4000) + self.ammonia_contract_price # €/tNH3
+        self.raw_isp = self.ammonia_strike_price
         self.ammonia_hourly_target = self.env.rfp.get_contract('Ammonia1').parameters.get('volume', 50000) / 8760 # tNH3/hour
         # Internal value of hydrogen production for Hydrogen1 contract.
         self.hydrogen_hourly_target = self.env.rfp.get_contract('Hydrogen1').parameters.get('volume', 1) # tH2/h
@@ -178,21 +253,29 @@ class DeterministicHA(HierarchicalAgent):
         simulation['available_power_for_ammonia'] = simulation['available_power'] - simulation['hourly_contract_need']
         simulation['shifted_available_power']     = simulation['available_power_for_ammonia']
         # Create shifted availability profile to account for negatives in case of large constant hydrogen outflow.
-        for ix in range(len(simulation)-1, 0, -1):
-            p = simulation.iloc[ix]['shifted_available_power']
-            if p<0: # Shift demand if there is not enough supply.
-                simulation.loc[simulation.index[ix], 'shifted_available_power'] = 0
-                simulation.loc[simulation.index[ix-1], 'shifted_available_power'] += p
-        simulation.loc[simulation.index[0], 'shifted_available_power'] = np.max([simulation.iloc[0]['shifted_available_power'], 0])
-        simulation['potential_ammonia_production'] = np.clip(simulation['shifted_available_power'] / self.electricity_consumption['ammonia'], 0,
-                                                            self.env.rfp.get_component('Haber Bosch Plant').parameters.get('capacity', 50)) # tNH3 for every hour
+        # for ix in range(len(simulation)-1, 0, -1):
+        #     p = simulation.iloc[ix]['shifted_available_power']
+        #     if p<0: # Shift demand if there is not enough supply.
+        #         simulation.loc[simulation.index[ix], 'shifted_available_power'] = 0
+        #         simulation.loc[simulation.index[ix-1], 'shifted_available_power'] += p
+        # simulation.loc[simulation.index[0], 'shifted_available_power'] = np.max([simulation.iloc[0]['shifted_available_power'], 0])
+        # simulation['potential_ammonia_production'] = np.clip(simulation['shifted_available_power'] / self.electricity_consumption['ammonia'], 0,
+        #                                                     self.env.rfp.get_component('Haber Bosch Plant').parameters.get('capacity', 50)) # tNH3 for every hour
         return simulation
 
-    def _calculate_hourly_ammonia_target(self, obs, time):
-        hours_in_year = (self.env.episode_end - time).value / 3600 * 1e-9 + 1 # The timedelta is in nanoseconds, we convert to hours inclusive (+1)
+    def _calculate_hourly_ammonia_target(self, obs, time, info):
         contract_ix = np.where(np.asarray(self.env.contract_names) == "Ammonia1")[0][0]
         storage_ix = np.where(np.asarray(self.env.storage_names) == "Ammonia Storage")[0][0]
-        self.ammonia_hourly_target = (self.env.contract_state_space.high[contract_ix] - obs['state']['contracts'][contract_ix] - obs['state']['storages'][storage_ix]) / hours_in_year # tNH3/day
+        
+        is_backcasting = bool(info.get("forecast_path", False))
+        if is_backcasting:
+            hourly_index = pd.to_datetime(pd.date_range(start=time, end=self.env.episode_end, freq='h'), utc=True)
+            target_frequency = self.env.rfp.get_contract("Ammonia1").parameters.get("target_frequency")
+            availability = self._get_availability(target_frequency, hourly_index)
+            hours_to_deadline = next((ix+1 for ix, x in enumerate(availability) if x > 0), 1)
+        else:
+            hours_to_deadline = (self.env.episode_end - time).value / 3600 * 1e-9 + 1 # The timedelta is in nanoseconds, we convert to hours inclusive (+1)
+        self.ammonia_hourly_target = (self.env.contract_state_space.high[contract_ix] - obs['state']['contracts'][contract_ix] - obs['state']['storages'][storage_ix]) / hours_to_deadline # tNH3/h
     
     def _set_new_hydrogen_volume(self, time:pd.Timestamp, n_forecasts=3, metric='median'):
         if self.env.load_data:
@@ -214,15 +297,21 @@ class DeterministicHA(HierarchicalAgent):
         # Dependent on metric, return an estimate of optimal contracted volume: (Much higher variance than on strike price - decision of metric more important)
         return self._get_metric(opt_volumes, metric=metric)
 
-    def _estimate_strike_price(self, obs, time:pd.Timestamp, info:dict, n_sims=3, metric='mean'):
-        if self.env.load_data:
+    def _estimate_strike_price_old(self, obs, time:pd.Timestamp, info:dict, n_sims=3, metric='mean'):
+        is_backcasting = bool(info.get("forecast_path", False))
+        if is_backcasting:
+            n_sims = 1
+            timestamp_str = time.strftime("%Y-%m-%d")
+            year_simulations = [pd.read_csv(info["forecast_path"] + f"long-term-sim_{timestamp_str}.csv", index_col=0)]
+        elif self.env.load_data:
             # if n_sims > 5:
             #     print("Only generated 5 simulations year ahead - setting number of sims to 5.")
             n_sims = 5
             timestamp_str = time.strftime("%Y%m%d")
-            updated_timestamp_str = timestamp_str[:-2] + '01'
-            hours_extra = (int(timestamp_str) - int(updated_timestamp_str))*24 # We have only generate for the start of each month. So we remove days which have already passed.
-            year_simulations = [pd.read_csv(f"{self.env.scenario_path}year_sim_{updated_timestamp_str}_{ix}.csv").iloc[hours_extra:] for ix in range(n_sims)]
+            # updated_timestamp_str = timestamp_str[:-2] + '01'
+            # hours_extra = (int(timestamp_str) - int(updated_timestamp_str))*24 # We have only generate for the start of each month. So we remove days which have already passed.
+            # year_simulations = [pd.read_csv(f"{self.env.scenario_path}year_sim_{updated_timestamp_str}_{ix}.csv").iloc[hours_extra:] for ix in range(n_sims)]
+            year_simulations = [pd.read_csv(f"{self.env.scenario_path}year_sim_{timestamp_str}_{ix}.csv") for ix in range(n_sims)]
         else:
             year_simulations = self.env.forecaster.simulate_year_ahead(start = time, n_sims=n_sims) # Creates a list of n_sims simulated year-ahead forecasts (pd.DataFrame with hourly index and 'price', 'wind', 'solar' columns)
         deadlines = {}
@@ -243,7 +332,7 @@ class DeterministicHA(HierarchicalAgent):
             target_volume_current = dict(zip(freq_options, np.zeros(len(freq_options))))
             target_volume_normal = dict(zip(freq_options, np.zeros(len(freq_options))))
             strike_price = 0
-            for freq in freq_options:
+            for freq, rank in freq_rank.items():
                 if freq == 'monthly':
                     target_volume_normal['monthly'] += target_volume_current['daily'] + target_volume_normal['daily'] * (deadlines['monthly'] - time).days
                 elif freq == 'yearly':
@@ -251,7 +340,7 @@ class DeterministicHA(HierarchicalAgent):
                 target_volume_current[freq] = target_volume_normal[freq]
                 if freq != 'hourly':
                     if self.env.load_data:
-                        sim_slice = simulation # We have only pre-generated sliced data. 
+                        sim_slice = simulation # We have only pre-generated sliced data.
                     else:
                         sim_slice = simulation.loc[pd.to_datetime(pd.date_range(start=time, end=deadlines[freq], freq='h'), utc=True)]
                     _sorted = sim_slice.sort_values(by='price', ascending=True)
@@ -293,60 +382,161 @@ class DeterministicHA(HierarchicalAgent):
             sp = max(self.ammonia_spot_price, sp)
         return sp
 
-    def _construct_concrete_data(self, obs, time):
-        """ Creates time, state, and steering signal of data object. """
-        time_index = pd.to_datetime(pd.date_range(time, time+pd.Timedelta(self.planning_horizon-1,'h'),freq='h'), utc=True)
-        datetime_data = {t: time_index[t] for t in range(self.planning_horizon)}
+    def _estimate_strike_price(self, obs, time:pd.Timestamp, info:dict, n_sims=3, metric='mean'):
+        try:
+            # -------------------- Produce projections -------------------- #
+            is_backcasting = bool(info.get("forecast_path", False))
+            if is_backcasting:
+                n_sims = 1
+                timestamp_str = time.strftime("%Y-%m-%d")
+                year_simulations = [pd.read_csv(info["forecast_path"] + f"long-term-sim_{timestamp_str}.csv", index_col=0)]
+            elif self.env.load_data:
+                # if n_sims > 5:
+                #     print("Only generated 5 simulations year ahead - setting number of sims to 5.")
+                n_sims = 5
+                timestamp_str = time.strftime("%Y%m%d")
+                # updated_timestamp_str = timestamp_str[:-2] + '01'
+                # hours_extra = (int(timestamp_str) - int(updated_timestamp_str))*24 # We have only generate for the start of each month. So we remove days which have already passed.
+                # year_simulations = [pd.read_csv(f"{self.env.scenario_path}year_sim_{updated_timestamp_str}_{ix}.csv").iloc[hours_extra:] for ix in range(n_sims)]
+                year_simulations = [pd.read_csv(f"{self.env.scenario_path}year_sim_{timestamp_str}_{ix}.csv") for ix in range(n_sims)]
+            else:
+                year_simulations = self.env.forecaster.simulate_year_ahead(start = time, n_sims=n_sims) # Creates a list of n_sims simulated year-ahead forecasts (pd.DataFrame with hourly index and 'price', 'wind', 'solar' columns)
+            
+            simulation_length = len(year_simulations[0])
+            hourly_index = pd.to_datetime(pd.date_range(start=time, end=time+pd.Timedelta(simulation_length-1, 'h'), freq='h'), utc=True)
+            freq_options = self.env.rfp.frequency_options
 
-        soc = dict(zip(self.env.storage_names, obs['state']['storages']))
-        for key, val in soc.items():
-            if val<0 and abs(val) < self.error_margin:
-                soc[key] = 0
-        contract_status = dict(zip(self.env.contract_names, obs['state']['contracts']))
-        for key, val in contract_status.items():
-            if val<0 and abs(val) < self.error_margin:
-                contract_status[key] = 0
-        # offtaker_availability = {(self.env.offtaker_names[ix], t) : obs['context']['offtakers'][t,ix]
-        #                          for ix in range(len(self.env.offtaker_names)) for t in range(self.planning_horizon)}
+            # -------------------- Get current status -------------------- #
+            allocated_contract_status = dict(zip(self.env.contract_names, obs['state']['contracts']))
+            storage_levels = dict(zip([storage.parameters.get("consumes")
+                                    for storage in self.env.rfp.get_storages().values()],
+                                    obs['state']['storages']))
+            stored_energy = sum(storage_levels[resource] * self.electricity_consumption[resource]
+                                    for resource in storage_levels.keys())
 
-        steering = None
-        if self.guideline == 'production_value':
-            steering = {'Haber Bosch Plant': self.ammonia_strike_price}
-        elif self.guideline == 'hourly_target':
-            steering = {None: self.ammonia_hourly_target}
-        
-        data = { # Set up the necessary data for the LP Concrete Model
-            None: {
-                'T_datetime': datetime_data, 
-                'init_soc': soc,
-                'init_contract_status' : contract_status,
-                # 'offtaker_availability': offtaker_availability,
-                self.guideline: steering,
-            }
-        }
-        return data
+            # -------------------- Calculate current shortfall -------------------- #
+            target_energy_standard  = dict(zip(freq_options, np.zeros(len(freq_options)))) # Power needed in MWh
+            target_energy_current = target_energy_standard.copy()
+            limits = ["min_volume", "max_volume"]
+            target_energy_standard_limits = {lim: target_energy_standard.copy() for lim in limits}
+            target_energy_current_limits = {lim: target_energy_standard.copy() for lim in limits}
+            for ix, name in enumerate(self.env.contract_names):
+                contract = self.env.rfp.get_contract(name)
+                target_frequency = contract.target_frequency
+                if target_frequency is not None:
+                    resource = contract.parameters.get("resource")
+                    target_volume = contract.parameters.get("volume")
+                    target_energy_standard[target_frequency] += target_volume * self.electricity_consumption[resource]
+                    target_energy_current[target_frequency] += max(0, target_volume-allocated_contract_status[name]) * self.electricity_consumption[resource]
+                    for lim in limits:
+                        _volume = contract.parameters.get(lim, target_volume)
+                        target_energy_standard_limits[lim][target_frequency] += _volume * self.electricity_consumption[resource]
+                        target_energy_current_limits[lim][target_frequency] += max(0, _volume-allocated_contract_status[name]) * self.electricity_consumption[resource]
 
-    def _run_hourly_model(self, obs, time, info):
-        self.hourly_model.run(verbose=False)
+            deadline_ts = {freq: self._get_availability(freq, hourly_index)
+                        for freq in freq_options}
+            first_target = {freq: next((ix for ix, x in enumerate(availability) if x > 0), 1)
+                                    for freq, availability in deadline_ts.items()}
+            energy_to_allocate = {freq: target_energy_standard[freq]*deadline_ts[freq]
+                                for freq in freq_options}
+            energy_to_allocate_limits = {lim: {freq: target_energy_standard_limits[lim][freq]*deadline_ts[freq]
+                                for freq in freq_options} for lim in limits}
+            for freq in freq_options:
+                energy_to_allocate[freq][first_target[freq]] = target_energy_current[freq]
+                for lim in limits:
+                    energy_to_allocate_limits[lim][freq][first_target[freq]] = target_energy_current_limits[lim][freq]
 
-        actions = self.hourly_model.get_actions()
-        if actions is not None:
-            return actions
-        else:
-            self._save_obs_for_debug(obs, info)
-            raise ValueError(f"Could not get actions.\nTime: {time}.\nState at termination: {obs['state']}.") 
+            # -------------------- Calculate internal strike price - based on contracts -------------------- #
+            strike_prices = np.zeros(n_sims)
+            strike_prices_hydrogen = np.zeros(n_sims)
+            deadline_timeindices = np.where((energy_to_allocate["monthly"] > 0) | (energy_to_allocate["yearly"] > 0))[0]
+
+            year_simulations_appended = [self._get_forecast_available_power(simulation) for simulation in year_simulations]
+
+            for t_ix in deadline_timeindices:
+                if t_ix < self.planning_horizon:
+                    continue
+                energy_needed = np.asarray(list(energy_to_allocate.values()))[1:,:(t_ix+1)].sum() # Excludes hourly contract energy need, which is subtracted from every hour instead.
+                hourly_energy_needed = np.asarray(list(energy_to_allocate.values()))[0,:(t_ix+1)].sum()
+                energy_needed_limits = {lim: np.asarray(list(energy_to_allocate_limits[lim].values()))[1:,:(t_ix+1)].sum() for lim in limits}
+                hourly_energy_needed_limits = {lim: np.asarray(list(energy_to_allocate_limits[lim].values()))[0,:(t_ix+1)].sum() for lim in limits}
+                missing_energy = max(0, energy_needed - stored_energy)
+                missing_energy_limits = {lim: max(0, energy_needed_limits[lim] - stored_energy) for lim in limits}
+                for sim_ix, simulation in enumerate(year_simulations_appended):
+                    sim_slice = simulation.iloc[:(t_ix+1)]
+                    _sorted = sim_slice.sort_values(by='price', ascending=True)
+                    
+                    # Now we can estimate the strike price of ammonia production:
+                    _sorted['cumulative_energy'] = np.cumsum(_sorted['available_power_for_ammonia'])
+                    n_hours = len(_sorted)
+                    strike_idx_hour = max(0, np.sum(_sorted['cumulative_energy'] <= missing_energy))
+                    if strike_idx_hour >= n_hours*0.98: # If 98% of the hours are needed, then we incentivise non-stop max production of ammonia.
+                        sp = self.ammonia_max_value / self.electricity_consumption['ammonia']
+                    else: # Otherwise we get a strike price estimate based on the marginal hour needed to produce the missing energy.
+                        sp = _sorted.iloc[strike_idx_hour]['price']
+                    
+                    strike_idx_hour_limits = {lim: max(0, np.sum(_sorted['cumulative_energy'] <= missing_energy_limits[lim])) for lim in limits}
+                    sp_limits = {}
+                    for lim in limits:
+                        if strike_idx_hour_limits[lim] >= n_hours*0.98:
+                            sp_limits[lim] = self.ammonia_max_value / self.electricity_consumption['ammonia']
+                        else: # Otherwise we get a strike price estimate based on the marginal hour needed to produce the missing energy.
+                            sp_limits[lim] = _sorted.iloc[strike_idx_hour_limits[lim]]['price']
+                    sp_clipped = np.clip(self.ammonia_contract_price / self.electricity_consumption['ammonia'], sp_limits['min_volume'], sp_limits['max_volume'])
+                    # The contract/deadline encouraging the highest ISP is the one we should be considering in order to meet all deadlines:
+                    strike_prices[sim_ix] = max(strike_prices[sim_ix], sp_clipped)
+                    
+                    # We can alternatively get an estimate of the strike price of the electrolyzer:
+                    _sorted['hourly_cumulative_energy'] = np.cumsum(_sorted['available_power'])
+                    hourly_strike_idx = max(0, np.sum(_sorted['hourly_cumulative_energy'] <= missing_energy + hourly_energy_needed) - 1)
+                    hourly_sp = _sorted.iloc[hourly_strike_idx]['price']
+                    strike_prices_hydrogen[sim_ix] = max(strike_prices_hydrogen[sim_ix], hourly_sp)
+            
+            # -------------------- Calculate internal strike price - capped by storages -------------------- #
+            # Storage limitations represent an upper bound for value of production:
+            storage_capacities = dict(zip([storage.parameters.get("consumes")
+                                    for storage in self.env.rfp.get_storages().values()],
+                                    [storage.parameters.get("capacity")
+                                    for storage in self.env.rfp.get_storages().values()]))
+            storage_energy_capacity = sum(storage_capacities[resource] * self.electricity_consumption[resource]
+                                    for resource in storage_capacities.keys())
+            available_storage = storage_energy_capacity - stored_energy
+            t_ix = first_target["monthly"] # Next ammonia shipment.
+            if t_ix >= self.planning_horizon:
+                for sim_ix, simulation in enumerate(year_simulations_appended):
+                    sim_slice = simulation.iloc[:(t_ix+1)]
+                    _sorted = sim_slice.sort_values(by='price', ascending=True)
+                    _sorted['cumulative_energy'] = np.cumsum(_sorted['available_power_for_ammonia'])
+                    n_hours = len(_sorted)
+                    strike_idx_hour = max(0, np.sum(_sorted['cumulative_energy'] <= available_storage)-1)
+                    if strike_idx_hour <= n_hours*0.5:
+                        sp = _sorted.iloc[strike_idx_hour]['price']
+                        strike_prices[sim_ix] = min(strike_prices[sim_ix], sp)
+
+            # -------------------- Convert, rationalize and save ISP -------------------- #
+            strike_prices_ammonia = strike_prices - strike_prices_hydrogen
+            # Dependent on metric, return an estimate of strike price:
+            isp = self._get_metric(strike_prices, metric=metric) * self.electricity_consumption['ammonia']
+            self.raw_isp = isp
+            isp = np.clip(isp, self.ammonia_spot_price, self.ammonia_max_value)
+        except FileNotFoundError:
+            print("Could not find simulation file for strike price estimation. Setting strike price to latest estimate.")
+            isp = self.ammonia_strike_price
+        return isp
 
     def _solve_hourly_decisions(self, obs, time:pd.Timestamp, info:dict):
         data = self._construct_concrete_data(obs, time)
+        if self.guideline == 'production_value':
+            data[None]["shipment_value"] = {"AmmoniaSpot": self.ammonia_spot_price - self.raw_isp, 
+                                             "Ammonia1": self.ammonia_strike_price}
         
-        forecasts, electricity_price_forecast = self._get_forecasts_and_electricity(time)
+        forecasts, electricity_price_forecast = self._get_forecasts_and_electricity(time, info)
         supplier_cf = self._get_supplier_cf(obs, forecasts[0])
         data[None]["supplier_cf"] = supplier_cf
         data[None]["electricity_price"] = electricity_price_forecast
 
         # Solve hourly LP model
-        self.hourly_model.build_concrete_instance(data=data)
-        return self._run_hourly_model(obs, time, info)
+        return self._run_hourly_model(obs, time, info, data)
 
     def _update_logbook(self):
         self.logbook['ammonia_strike_price'].append(self.ammonia_strike_price)
@@ -357,11 +547,14 @@ class DeterministicHA(HierarchicalAgent):
     def pi(self, obs, k, info:dict):
         """ Hierarchical policy for the agent. We start by defining the guidelines for the hourly decisions. """
         time = info["time"]
+        is_backcasting = bool(info.get("forecast_path", False))
+
         if self.guideline == 'hourly_target':
             # Constant heuristic:
-            self._calculate_hourly_ammonia_target(obs, time)
-        else:
-            if time.day % 15 == 1 and self.guideline == 'production_value': # We do not expect big changes in strike price throughout the year - update two times a month.
+            self._calculate_hourly_ammonia_target(obs, time, info)
+        elif self.guideline == 'production_value':
+            if (is_backcasting and k % 7 == 0) ^ (not is_backcasting and time.day_of_week == 0):
+                # We do not expect dynamic changes in strike price throughout the year - updates weekly.
                 self.ammonia_strike_price = self._estimate_strike_price(obs=obs, time=time, info=info, n_sims=self.n_sims, metric=self.isp_metric)
 
         actions = self._solve_hourly_decisions(obs=obs, time=time, info=info) # Day-ahead solving
@@ -389,14 +582,18 @@ class StochasticHA(DeterministicHA):
             self.hourly_model.n_scenarios = n_scenarios # Default can be found in HourlyStochasticLPModel
             self.hourly_model.initialize_model() # If we want to specify number of scenarios at this point we rebuild the hourly model.
     
-    def _get_forecasts_and_electricity(self, t):
-        if self.env.load_data:
-            timestamp_str = t.strftime("%Y%m%d")
+    def _get_forecasts_and_electricity(self, time, info):
+        is_backcasting = bool(info.get("forecast_path", False))
+        if is_backcasting:
+            timestamp_str = time.strftime("%Y-%m-%d")
+            forecasts = [pd.read_csv(info["forecast_path"] + f"forecast_{timestamp_str}.csv", index_col=0)]
+        elif self.env.load_data:
+            timestamp_str = time.strftime("%Y%m%d")
             assert self.hourly_model.n_scenarios <= 10
             forecasts = [pd.read_csv(f"{self.env.scenario_path}forecast_{timestamp_str}_{ix}.csv") for ix in range(self.hourly_model.n_scenarios)]
         else:
-            forecasts = self.env.forecaster.forecast(start=t,
-                                                    end=t+pd.Timedelta(self.planning_horizon-1, 'h'),
+            forecasts = self.env.forecaster.forecast(start=time,
+                                                    end=time+pd.Timedelta(self.planning_horizon-1, 'h'),
                                                     n_forecasts=self.hourly_model.n_scenarios,
                                                     simulate_prices=True) # Returns list of DFs
         # Scenario dependent electricity price forecasts:
@@ -432,6 +629,7 @@ class RecourseAgent(StochasticHA):
                          n_sims=n_sims, n_scenarios=n_scenarios, **kwargs)
         self.da_model_type = da_model_type
         self.da_bid_model = StochasticRecourseModel(rfp = self.env.rfp,
+                                                inflexible = self.env.inflexible,
                                                 planning_horizon = self.planning_horizon,
                                                 decision_horizon = self.decision_horizon,
                                                 solver = solver,
@@ -442,6 +640,7 @@ class RecourseAgent(StochasticHA):
                                                 **kwargs,
                                                 )
         self.hourly_model = StochasticRecourseModel(rfp = self.env.rfp,
+                                        inflexible = self.env.inflexible,
                                         planning_horizon = self.planning_horizon,
                                         decision_horizon = self.decision_horizon,
                                         solver = solver,
@@ -480,12 +679,12 @@ class RecourseAgent(StochasticHA):
             data[None]['T_datetime'] = datetime_data
         return data
 
-    def _create_data_dict_for_bidding(self, obs, k, time):
+    def _create_data_dict_for_bidding(self, obs, k, time, info):
         data = self._construct_concrete_data(obs, k, time)
 
         # & Known at current time: PPA volumes, 12 hours of prices.
         # Returns price forecasts for D and D+:
-        forecasts, electricity_price_forecasts = self._get_forecasts_and_electricity(time)
+        forecasts, electricity_price_forecasts = self._get_forecasts_and_electricity(time, info)
         full_electricity_price_forecasts = {}
         # Returns PPA volumes for D and forecasts for D+:
         supplier_cf = self._get_supplier_cf(obs, forecasts)
@@ -610,7 +809,7 @@ class RecourseAgent(StochasticHA):
         return accepted_volumes
 
     def _bid_and_clear_dayahead(self, obs, k, time:pd.Timestamp, info:dict):
-        data = self._create_data_dict_for_bidding(obs, k, time)
+        data = self._create_data_dict_for_bidding(obs, k, time, info)
 
         if k == 0:
             self.da_bid_model.fixed_horizon = 0
@@ -645,15 +844,14 @@ class RecourseAgent(StochasticHA):
             self.hourly_model.decision_horizon = self.decision_horizon + 12
             self.hourly_model.fixed_horizon = 12
             self.hourly_model.initialize_model()
-        self.hourly_model.build_concrete_instance(data=data)
-        return self._run_hourly_model(obs, time, info)
+        return self._run_hourly_model(obs, time, info, data)
 
     def _solve_hourly_decisions(self, obs, k, time:pd.Timestamp, info:dict):
         # Accepted DA volumes and realized prices for the following day.
         # We are bidding at D-1 12:00 and realize the DA market for D 00:00-24:00:
         newly_accepted_volumes, newly_realized_prices = self._bid_and_clear_dayahead(obs, k, time, info)
         
-        data = self._create_data_dict_for_bidding(obs, k, time)
+        data = self._create_data_dict_for_bidding(obs, k, time, info)
         # & Now we update the data with the realized prices and DA volumes for day D.
         for s in range(self.n_scenarios):
             for t in range(self.decision_horizon):
@@ -674,7 +872,7 @@ class RecourseAgent(StochasticHA):
     def pi(self, obs, k, info:dict):
         """ Hierarchical policy for the agent. We start by defining the guidelines for the hourly decisions. """
         time = info["time"]
-        if time.day % 15 == 1 and self.guideline == 'production_value': # We do not expect big changes in strike price throughout the year - update two times a month.
+        if time.day_of_week == 0 and self.guideline == 'production_value': # We do not expect big changes in strike price throughout the year - update two times a month.
             self.ammonia_strike_price = self._estimate_strike_price(obs=obs, time=time, info=info, n_sims=self.n_sims, metric='mean')
         
         actions = self._solve_hourly_decisions(obs=obs, k=k, time=time, info=info) # Day-ahead solving
@@ -710,13 +908,17 @@ class StrikePriceBiddingAgent(RecourseAgent):
                          guideline=guideline, hourly_model_class=hourly_model_class,
                          solver=solver, documentation=documentation, n_scenarios=n_scenarios,
                          n_sims=n_sims, **kwargs)
-        self.n_strike_prices=n_strike_prices
+        self.n_strike_prices = n_strike_prices
         if self.n_strike_prices > 1:
             self.n_sims = self.n_strike_prices
         self.ammonia_strike_price_list = None
         self.logbook['ammonia_strike_price_list'] = []
         self.gcp_cap = self.env.rfp.get_component("Grid Connection Point").parameters.get("capacity")
-    
+        self.min_load = 0
+        if self.env.inflexible:
+            for name, link in self.env.rfp.get_links().items():
+                self.min_load += link.parameters.get("electricity_consumption", 0) * link.parameters.get("min_load", 0) * link.parameters.get("capacity")
+
     def _update_logbook(self):
         super()._update_logbook()
         self.logbook['ammonia_strike_price_list'].append(self.ammonia_strike_price_list)
@@ -733,7 +935,7 @@ class StrikePriceBiddingAgent(RecourseAgent):
 
         def _interpolate_volumes(t):
             max_volume = (self.gcp_cap - ppa_power[t]) * self.allow_spot_buy # How much we can max buy
-            min_volume = -ppa_power[t] # How much we can max sell (negative value because of convention)
+            min_volume = -(ppa_power[t] - self.min_load) # How much we can max sell (negative value because of convention)
             return np.linspace(max_volume, min_volume, len(prices))
         volumes = np.asarray([_interpolate_volumes(t) for t in range(T)])
         
@@ -772,7 +974,7 @@ class StrikePriceBiddingAgent(RecourseAgent):
     def pi(self, obs, k, info:dict):
         """ Hierarchical policy for the agent. We start by defining the guidelines for the hourly decisions. """
         time = info["time"]
-        if time.day % 15 == 1: # We do not expect big changes in strike price throughout the year - update two times a month.
+        if time.day_of_week == 0: # We do not expect big changes in strike price throughout the year - update two times a month.
             self.ammonia_strike_price_list = self._estimate_strike_price(obs=obs, time=time, info=info, n_sims=self.n_sims, metric=None)
             self.ammonia_strike_price = self._get_metric(self.ammonia_strike_price_list,metric='mean')
 
@@ -982,10 +1184,16 @@ class BiddingCurveAgent(RecourseAgent):
                 rp = real_prices[t]
                 vol = power_traded[t]
                 buy_profile = list(buy_volumes[t].items())
-                buy_profile.insert(0, (buy_profile[0][0], 0))
+                if len(buy_profile) == 0:
+                    buy_profile = [(-500,0), (-500,0)]
+                else:
+                    buy_profile.insert(0, (buy_profile[0][0], 0))
                 buy_profile = np.asarray(buy_profile)
                 sell_profile = list(sell_volumes[t].items())
-                sell_profile.append((sell_profile[-1][0], 0))
+                if len(sell_profile) == 0:
+                    sell_profile = [(4000,0), (4000,0)]
+                else:
+                    sell_profile.append((sell_profile[-1][0], 0))
                 sell_profile = np.asarray(sell_profile)
                 max_v = max(max_v, np.max(-sell_profile[:,1]), np.max(buy_profile[:,1]))
                 ax.set_title(f"{t}:00-{t+1}:00", fontweight="normal")
@@ -1021,7 +1229,7 @@ class BiddingCurveAgent(RecourseAgent):
     def pi(self, obs, k, info:dict):
         """ Hierarchical policy for the agent. We start by defining the guidelines for the hourly decisions. """
         time = info["time"]
-        if time.day % 15 == 1 and self.guideline == 'production_value': # We do not expect big changes in strike price throughout the year - update two times a month.
+        if time.day_of_week == 0 and self.guideline == 'production_value': # We do not expect big changes in strike price throughout the year - update two times a month.
             self.ammonia_strike_price_list = self._estimate_strike_price(obs=obs, time=time, info=info, n_sims=self.n_sims, metric=None)
             self.ammonia_strike_price = self._get_metric(self.ammonia_strike_price_list,metric='mean')
             if self.n_price_domains > 1:
@@ -1062,4 +1270,242 @@ class BiddingCurveAgent(RecourseAgent):
     def __repr__(self):
         return self.__class__.__name__ + str(self.n_scenarios) + "_D" + str(self.n_price_domains)
 
+
+class AggregateFullHorizonAgent(HierarchicalAgent):
+    def __init__(self,
+                 env,
+                 *args,
+                 writer=None,
+                 planning_horizon:int = 4*24,
+                 hourly_model_class=AggregativeModel,
+                 solver='gurobi',
+                 documentation=False,
+                 objective_logic=None,
+                 n_sims=2,
+                 **kwargs,
+                 ):
+        super().__init__(env, *args,
+                         writer=writer, planning_horizon=planning_horizon, guideline=None, hourly_model_class=hourly_model_class,
+                         solver=solver, documentation=documentation, objective_logic=objective_logic, **kwargs)
+        self.n_sims = n_sims
+
+        self.average_price_projection = [ppa.parameters.get("price") for name, ppa in self.env.rfp.get_ppas().items() if not(ppa.parameters.get("simulated"))][0]
+        self.average_cf_projection = {name: ppa.parameters.get("annual_cf") for name, ppa in self.env.rfp.get_ppas().items()}
+        
+        self.longterm_horizon = 0
+        self.offtaker_availabilities = None
+        self.contract_deadlines = None
+
+        self.logbook = {"average_price_projection": [],
+                        "average_cf_projection": [],}
+    
+    def _estimate_longterm_uncertainties(self, obs, time, info):
+        is_backcasting = bool(info.get("forecast_path", False))
+        if is_backcasting:
+            n_sims = 1
+            timestamp_str = time.strftime("%Y-%m-%d")
+            year_simulations = [pd.read_csv(info["forecast_path"] + f"long-term-sim_{timestamp_str}.csv", index_col=0)]
+        elif self.env.load_data:
+            # if n_sims > 5:
+            #     print("Only generated 5 simulations year ahead - setting number of sims to 5.")
+            n_sims = 5
+            timestamp_str = time.strftime("%Y%m%d")
+            # Get timestamp_str of the start of the week, since we only have estimates every week:
+            # latest_projection_time = time - pd.Timedelta(time.day_of_week, unit="d")
+            # updated_timestamp_str = latest_projection_time.strftime("%Y%m%d")
+            # hours_extra = (int(timestamp_str) - int(updated_timestamp_str))*24 
+            # year_simulations = [pd.read_csv(f"{self.env.scenario_path}year_sim_{updated_timestamp_str}_{ix}.csv").iloc[hours_extra:] for ix in range(n_sims)]
+            year_simulations = [pd.read_csv(f"{self.env.scenario_path}year_sim_{timestamp_str}_{ix}.csv") for ix in range(n_sims)]
+        else:
+            n_sims = self.n_sims
+            year_simulations = self.env.forecaster.simulate_year_ahead(start = time, n_sims=n_sims) # Creates a list of n_sims simulated year-ahead forecasts (pd.DataFrame with hourly index and 'price', 'wind', 'solar' columns)
+
+        # self.longterm_horizon = max(((self.env.episode_end - time).days + 1) * 24 - self.planning_horizon, 0)
+        ts = pd.to_datetime(year_simulations[0].index)
+        current_year = ts[self.planning_horizon].year
+
+        longterm_horizon = max(len(ts[ts.year<=current_year]) - self.planning_horizon, 0)
+        average_price_projection = 0
+        average_cf_projection = {key: 0 for key in self.env.ppa_names}
+        
+        if longterm_horizon > 0:
+            lth_slice = range(self.planning_horizon, self.planning_horizon+longterm_horizon)
+            average_price_projection = np.mean([sim["price"].iloc[lth_slice].values
+                                                for sim in year_simulations])
+            for name, ppa in self.env.rfp.get_ppas().items():
+                cf = 0
+                for simulation in year_simulations:
+                    if ppa.parameters.get("consumes") == 'wind':
+                        cf += np.mean(self.env.wind_mapper(simulation['wind'].iloc[lth_slice]))
+                    elif ppa.parameters.get("consumes") == 'solar':
+                        cf += np.mean(self.env.solar_mapper(simulation['solar'].iloc[lth_slice]))
+                    else:
+                        cf += 1 # Assumes full availability of non-variable PPAs.
+                average_cf_projection[name] = cf / n_sims
+        
+        return longterm_horizon, average_price_projection, average_cf_projection
+    
+    def _solve_hourly_decisions(self, obs, time:pd.Timestamp, info:dict):
+        data = self._construct_concrete_data(obs, time)
+        
+        forecasts, electricity_price_forecast = self._get_forecasts_and_electricity(time, info)
+        supplier_cf = self._get_supplier_cf(obs, forecasts[0])
+        data[None]["supplier_cf"]       = supplier_cf
+        data[None]["electricity_price"] = electricity_price_forecast
+        
+        ### Aggregative model specific data:
+        if self.longterm_horizon > 0:
+            data[None]["longterm_horizon"]  = {None: self.longterm_horizon}
+            data[None]["longterm_price"]    = {None: self.average_price_projection}
+            data[None]["longterm_cf"]       = self.average_cf_projection
+            data[None]["offtaker_availabilities"] = dict(self.offtaker_availabilities.iloc[self.planning_horizon:].sum())
+            data[None]["contract_deadlines"] = dict(self.contract_deadlines.iloc[self.planning_horizon:].sum())
+
+        # Solve hourly LP model
+        return self._run_hourly_model(obs, time, info, data)
+
+    def _update_logbook(self):
+        self.logbook["average_price_projection"].append(self.average_price_projection)
+        self.logbook["average_cf_projection"].append(self.average_cf_projection)
+
+    def get_schedules(self, time, end_time):
+        """ Returns offtaker schedules and contract deadline schedules from time to time + horizon. """        
+        hourly_index = pd.to_datetime(pd.date_range(start=time, end=end_time, freq='h'), utc=True)
+        
+        offtaker_availabilities = {}
+        for name, offtaker in self.env.rfp.get_offtakers().items():
+            availability_frequency = offtaker.parameters.get("availability")
+            offtaker_availabilities[name] = self._get_availability(availability_frequency, hourly_index)
+        df_offtakers = pd.DataFrame(offtaker_availabilities, index=hourly_index)
+
+        contract_deadlines = {}
+        for name, contract in self.env.rfp.get_contracts().items():
+            target_frequency = contract.parameters.get("target_frequency")
+            contract_deadlines[name] = self._get_availability(target_frequency, hourly_index)
+        df_contracts = pd.DataFrame(contract_deadlines, index=hourly_index)
+
+        return df_offtakers, df_contracts
+
+    def pi(self, obs, k, info:dict):
+        time = info["time"]
+        is_backcasting = bool(info.get("forecast_path", False))
+
+        if (is_backcasting and k % 7 == 0) ^ (time.day_of_week == 0 and not is_backcasting): # We do not expect big changes in strike price throughout the year - update two times a month.
+            self.longterm_horizon, self.average_price_projection, self.average_cf_projection = self._estimate_longterm_uncertainties(obs, time, info)
+        else:
+            self.longterm_horizon = max(self.longterm_horizon - self.decision_horizon, 0)
+        
+        end_time = time + pd.Timedelta(self.planning_horizon + self.longterm_horizon - 1, 'h')
+        self.offtaker_availabilities, self.contract_deadlines = self.get_schedules(time, end_time) # Get offtaker availabilities for the whole year, since we will use this as a guideline for the whole year.
+        
+        actions = self._solve_hourly_decisions(obs=obs, time=time, info=info) # Day-ahead solving
+        self._update_logbook()
+
+        return np.asarray(actions)
+
+
+class RecedingHorizonAgent(HierarchicalAgent):
+    def __init__(self,
+                 env,
+                 *args,
+                 writer=None,
+                 planning_horizon:int = 4*24,
+                 guideline:str|None = None,
+                 hourly_model_class=HourlyDeterministicLPModel,
+                 solver='gurobi',
+                 documentation=False,
+                 objective_logic=None,
+                 **kwargs,
+                 ):
+        super().__init__(env, *args,
+                         writer=writer, planning_horizon=planning_horizon, guideline=guideline,
+                         hourly_model_class=hourly_model_class, solver=solver,
+                         documentation=documentation, objective_logic=objective_logic, **kwargs)
+        self.price_projection = None
+        self.cf_projection = None
+        self.longterm_horizon = 0
+        self.year_sim = None
+    
+    def _project_longterm_uncertainties(self, obs, k, time, info):
+        is_backcasting = bool(info.get("forecast_path", False))
+        if is_backcasting and k % 7 == 0:
+            timestamp_str = time.strftime("%Y-%m-%d")
+            self.year_sim = pd.read_csv(info["forecast_path"] + f"long-term-sim_{timestamp_str}.csv", index_col=0)
+        elif self.env.load_data and time.day_of_week == 0:
+            # if n_sims > 5:
+            #     print("Only generated 5 simulations year ahead - setting number of sims to 5.")
+            timestamp_str = time.strftime("%Y%m%d")
+            # Get timestamp_str of the start of the week, since we only have estimates every week:
+            # latest_projection_time = time - pd.Timedelta(time.day_of_week, unit="d")
+            # updated_timestamp_str = latest_projection_time.strftime("%Y%m%d")
+            # hours_extra = (int(timestamp_str) - int(updated_timestamp_str))*24 
+            # year_simulations = [pd.read_csv(f"{self.env.scenario_path}year_sim_{updated_timestamp_str}_{ix}.csv").iloc[hours_extra:] for ix in range(n_sims)]
+            self.year_sim = pd.read_csv(f"{self.env.scenario_path}year_sim_{timestamp_str}_0.csv")
+        elif time.day_of_week == 0 or self.year_sim is None:
+            self.year_sim = self.env.forecaster.simulate_year_ahead(start = time, n_sims=1)[0] # Creates a list of n_sims simulated year-ahead forecasts (pd.DataFrame with hourly index and 'price', 'wind', 'solar' columns)
+        else:
+            self.year_sim = self.year_sim.iloc[self.decision_horizon:]
+        
+        longterm_horizon = max(len(self.year_sim) - self.planning_horizon, 0)
+        price_projection = []
+        cf_projection = {key: [] for key in self.env.ppa_names}
+        
+        if longterm_horizon > 0:
+            price_projection = self.year_sim["price"].iloc[-longterm_horizon:].values
+            for name, ppa in self.env.rfp.get_ppas().items():
+                cf = np.ones(len(self.year_sim)) # Assumes full availability of non-variable PPAs.
+                if ppa.parameters.get("consumes") == 'wind':
+                    cf = self.env.wind_mapper(self.year_sim['wind']).values
+                elif ppa.parameters.get("consumes") == 'solar':
+                    cf = self.env.solar_mapper(self.year_sim['solar']).values
+                cf_projection[name] = cf[-longterm_horizon:]
+        
+        return longterm_horizon, price_projection, cf_projection
+
+    def _get_supplier_cf(self, obs, forecast):
+        wind_profile    = self.env.wind_mapper(forecast['wind'])
+        solar_profile   = self.env.solar_mapper(forecast['solar'])
+        
+        supplier_cf = {}
+        for ix, ppa_name in enumerate(self.env.ppa_names):
+            ppa = self.env.rfp.get_ppa(ppa_name)
+            forecast_profile = np.ones(self.planning_horizon)
+            if ppa.parameters.get("consumes") == 'wind':
+                forecast_profile = wind_profile.values
+            elif ppa.parameters.get("consumes") == 'solar':
+                forecast_profile = solar_profile.values
+            forecast_profile[:self.env.ppa_context_space.shape[0]] = obs['context']['ppas'][:,ix]
+            cf_forecast = {(ppa_name, t): forecast_profile[t] for t in range(self.planning_horizon)}
+            cf_longterm = {(ppa_name, t + self.planning_horizon): self.cf_projection[ppa_name][t] for t in range(self.longterm_horizon)}
+            supplier_cf = {**supplier_cf, **cf_forecast, **cf_longterm}
+        return supplier_cf
+
+    def _solve_hourly_decisions(self, obs, time:pd.Timestamp, info:dict):
+        full_horizon = self.planning_horizon + self.longterm_horizon
+
+        self.hourly_model.planning_horizon = full_horizon
+        self.hourly_model.initialize_model()
+
+        data = self._construct_concrete_data(obs, time)
+        time_index = pd.to_datetime(pd.date_range(time, time+pd.Timedelta(full_horizon-1,'h'),freq='h'), utc=True)
+        datetime_data = {t: time_index[t] for t in range(full_horizon)}
+        data[None]["T_datetime"] = datetime_data
+
+        forecasts, electricity_price_forecast = self._get_forecasts_and_electricity(time, info)
+        electricity_price_forecast.update({t + self.planning_horizon: self.price_projection[t] for t in range(self.longterm_horizon)})
+        supplier_cf = self._get_supplier_cf(obs, forecasts[0])
+        data[None]["supplier_cf"] = supplier_cf
+        data[None]["electricity_price"] = electricity_price_forecast
+
+        # Solve hourly LP model
+        return self._run_hourly_model(obs, time, info, data)
+
+    def pi(self, obs, k, info:dict):
+        time = info["time"]
+        # self.longterm_horizon = max(((self.env.episode_end - time).days + 1) * 24 - self.planning_horizon, 0)
+        self.longterm_horizon, self.price_projection, self.cf_projection = self._project_longterm_uncertainties(obs, k, time, info)
+        actions = self._solve_hourly_decisions(obs=obs, time=time, info=info) # Day-ahead solving
+        self._update_logbook()
+
+        return np.asarray(actions)
 

@@ -8,18 +8,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from data_scripts.data_generator_v2 import DataForecaster
 from common_scripts import cache_read
+from model_scripts.environment import EmissionFactorEstimator
 
 import pandas as pd
 import numpy as np
 from dateutil.relativedelta import relativedelta
-
-class EmissionFactorEstimator:
-    """  """
-    def __init__(self, model):
-        self.model = model
-    
-    def __call__(self, *args, **kwds):
-        return np.clip(self.model.predict(*args, **kwds), 0, np.inf)
 
 forecaster = DataForecaster(from_pickle=True, cache_id="Anders")
 forecaster = forecaster.unpickle()

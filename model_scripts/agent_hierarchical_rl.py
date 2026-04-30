@@ -4,7 +4,7 @@ import gymnasium as gym
 
 from common_scripts.utils import Flattener
 from model_scripts.hourly_models import HourlyDeterministicLPModel
-from model_scripts.environment import RFPShieldEnv, RFPEnv
+from model_scripts.environment import RFPShieldEnv, RFPModelActionsEnv
 from model_scripts.rl_agents import NN_DDPGAgent
 from model_scripts.agent_hierarchical_heuristic import HierarchicalAgent, DeterministicHA
 
@@ -131,7 +131,7 @@ class StateValueHA(DeterministicHA):
     guideline_options = ('production_value', None)
 
     def __init__(self,
-                 env:RFPEnv,
+                 env:RFPModelActionsEnv,
                  writer=None,
                  guideline = "production_value",
                  hourly_model_class=HourlyDeterministicLPModel,

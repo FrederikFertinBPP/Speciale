@@ -7,7 +7,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from common_scripts import train # stats, trajectories = train(env, agent, num_episodes=n_episodes, verbose=True, seed=42)
-from model_scripts.environment import RFPEnv, get_env
+from model_scripts.environment import RFPModelActionsEnv, get_env
 from model_scripts.agent_hierarchical_heuristic import DeterministicHA
 
 def main():
@@ -21,13 +21,15 @@ def main():
 
     n_episodes = 20
 
+    env_config = {"allow_spot_buy": allow_spot_buy, "balancing_market": False, "verbose": True, "load_data": True, "inflexible": False}
+    
     # scenarios = ["default", "80percent_ammonia", "70percent_ammonia", "60percent_ammonia", "50percent_ammonia", "40percent_ammonia", "no_solar_power", "high_RE_level"]
     # scenarios = ["80percent_ammonia", "70percent_ammonia", "60percent_ammonia", "40percent_ammonia"]
     # scenarios = ["base_case_no_spot", "no_solar_power", "high_RE_level"]
     scenarios = ["50percent_ammonia"]
     # scenarios = ["30percent_ammonia", "20percent_ammonia", ]
     for scenario in scenarios:
-        env = get_env(RFPEnv, allow_spot_buy=allow_spot_buy, balancing_market=False, verbose=True, load_data=True, scenario_name=scenario)
+        env = get_env(RFPModelActionsEnv, env_config=env_config, scenario_name=scenario)
         
         agent = DeterministicHA(env=env, solver=solver, planning_horizon=planning_horizon, guideline=guideline, isp_metric=isp_metric)
         

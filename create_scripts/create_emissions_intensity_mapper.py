@@ -12,6 +12,53 @@ import statsmodels.api as sm
 from common_scripts.utils import set_plotting_style
 set_plotting_style()
 
+import xgboost as xgb
+
+def get_fossil_prices(hourly_index, price_indicator="c"):
+    path = "historical_data/commodity_prices/"
+    def _concat(df1, df2):
+        df = pd.concat([df1,df2])
+        df.index = pd.to_datetime([pd.Timestamp(t,unit="s") for t in df["t"]],utc=True)
+        df = df.sort_index()
+        df = df.drop_duplicates(subset="t")
+        return df
+    df_gas_monthly = pd.read_json(f"{path}gas_futures_monthly.json")
+    df_gas_weekly = pd.read_json(f"{path}gas_futures_weekly.json")
+    df_gas = _concat(df_gas_monthly, df_gas_weekly)
+
+    df_oil_monthly = pd.read_json(f"{path}oil_brent_monthly.json")
+    df_oil_weekly = pd.read_json(f"{path}oil_brent_weekly.json")
+    df_oil = _concat(df_oil_monthly, df_oil_weekly)
+    
+    df_ets = pd.read_excel(f"{path}prices_eu_ets_all.xlsx",sheet_name="Data")
+    df_ets.index = pd.to_datetime(df_ets["datetime"],utc=True)
+    df_ets = df_ets.sort_index()
+    df_ets = df_ets.drop_duplicates(subset="datetime")
+    
+    def _add_series(df,column,series,key,):
+        df = df.copy()
+        series_lim = series.loc[(series.index >= df.index[0]) & (series.index <= df.index[-1]),key]
+        row_indexer_df = [t in series_lim.index for t in df.index]
+        df.loc[row_indexer_df, column] = series_lim.values
+        df.loc[df.index[0],column] = series.iloc[max(0, sum(series.index <= df.index[0])-1)][key]
+        df.loc[df.index[-1],column] = series.iloc[min(sum(series.index < df.index[-1]), len(series)-1)][key]
+        return df
+
+    # hourly_index = pd.to_datetime(pd.date_range(start="2010-01-01", end="2025-12-31"),utc=True)
+    df = pd.DataFrame(index=hourly_index, columns=["gas","oil","ets"], dtype=float)
+    df = _add_series(df, "gas", df_gas, price_indicator)
+    df = _add_series(df, "oil", df_oil, price_indicator)
+    df = _add_series(df, "ets", df_ets, "price")
+    df = df.interpolate()
+
+    return df
+
+
+
+
+
+
+
 df_ren_prices = pd.read_csv("historical_data/clean_dataframes/server-ENTSOEcountry-PT2024-01-01to2024-12-31.csv", index_col=0)
 df_ren_prices.index = pd.to_datetime(df_ren_prices.index, utc=True)
 
@@ -104,3 +151,26 @@ cache_path = os.getcwd() + "/models/plant_models/emission_factor.pkl"
 cache_write(model, cache_path, verbose=True)
 
 print("Done")
+
+y_true = df_ren_prices["price"]
+df_fossil = get_fossil_prices(hourly_index=y_true.index)
+# df_fossil = df_fossil[["gas","ets"]]
+X = pd.concat([df_ren_prices[["wind", "solar"]],df_fossil],axis=1,)
+reg = xgb.XGBRegressor(tree_method="hist")
+# Fit the model using predictor X and response y.
+reg.fit(X=X, y=y_true)
+y_pred = reg.predict(X)
+print(root_mean_squared_error(y_true,y_pred))
+
+model = LinearRegression()
+model.fit(X=X, y=y_true)
+y_pred_lr = model.predict(X)
+print(root_mean_squared_error(y_true, y_pred_lr))
+# X_ols = sm.add_constant(X)
+# model = sm.OLS(y_true, X_ols)
+# results = model.fit()
+# print(results.summary())
+
+df_results = pd.DataFrame(data={"true":np.sort(y_true.values),"XGB":np.sort(y_pred),"LR":np.sort(y_pred_lr)})
+df_results.plot()
+

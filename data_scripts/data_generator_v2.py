@@ -7,7 +7,6 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 
 import statsmodels.api as sm
-import pmdarima as pm
 
 import pandas as pd
 from dateutil.relativedelta import relativedelta
@@ -22,6 +21,7 @@ from numba import jit
 
 #%% Common functions
 def plot_acf(ts):
+    import pmdarima as pm
     if type(ts) == pd.DataFrame:
         ts_tag = ts.columns[0]
     elif type(ts) == pd.Series:
@@ -111,37 +111,45 @@ class SimulationTool:
         plt.savefig(f'documentation/{self.forecaster.plot_dir}{name}.png')
         plt.close()
     
-    def _fit_arima_model(self, time_series, order=(5,0,1), seasonal_order=(0, 0, 0, 0), name = ""):
+    def _fit_arima_model(self, time_series, order=(5,0,1), seasonal_order=(0, 0, 0, 0), name = "", old_model = None):
         # Fit ARIMA model to the remaining stochastic process
         s_order = "" if sum(seasonal_order) == 0 else f"_s{seasonal_order}"
         cache_path = os.getcwd() + "/models/ts_models/" + self.tool_type + "/" + name + str(order) + s_order + str(self.cache_id) + ".pkl"
         if self.cache_id is not None and not(self.cache_replace) and cache_exists(cache_path):
-            arima_model = cache_read(cache_path)
+            # res = cache_read(cache_path)
+            res = sm.tsa.statespace.SARIMAXResults.load(cache_path)
         else:
             if self.verbose: print(self.tool_type + name + ' model initialization'); t_start = time()
-            if self.auto_arima:
-                arima_model = pm.auto_arima(y=time_series, d=0, seasonal=True, m=24, error_action='ignore', suppress_warnings=True)
-            else:
-                arima_model = pm.ARIMA(order=order, seasonal_order=seasonal_order, suppress_warnings=True, )
-            arima_model.fit(time_series)
+            try:
+                model = sm.tsa.statespace.SARIMAX(endog=time_series, order=order, seasonal_order=seasonal_order,
+                                                  dates=time_series.index, freq=time_series.index.freq)
+                res = model.fit(start_params=(old_model.params.values if old_model else None))
+            except Exception as e:
+                print("Error fitting ARIMA model:", e)
+                print("Attempting to fit without enforcing stationarity..")
+                model = sm.tsa.statespace.SARIMAX(endog=time_series, order=order, seasonal_order=seasonal_order,
+                                                  dates=time_series.index, freq=time_series.index.freq, enforce_stationarity=False)
+                res = model.fit(start_params=(old_model.params.values if old_model else None))
             if self.verbose: print(self.tool_type + f' model fitted in {time() - t_start} seconds.')
-            if self.cache_id is not None: cache_write(arima_model, cache_path, verbose=self.verbose)
+            if self.cache_id is not None:
+                res.save(cache_path)
+                # cache_write(res, cache_path, verbose=self.verbose)
         # self.last_state['endog_arima'] = time_series.iloc[-24:]
-        return arima_model
+        return res
 
     def _arima_simulate(self, horizon = 8760, realize = False, repetitions=None):
         if self.arima_model is not None:
-            sim = self.arima_model.arima_res_.simulate(nsimulations=horizon, anchor='end', repetitions=repetitions).values # We can specify repetitions to save time when doing multiple simulations (realize whould be false)
+            sim = self.arima_model.simulate(nsimulations=horizon, anchor='end', repetitions=repetitions).values # We can specify repetitions to save time when doing multiple simulations (realize whould be false)
             if realize:
-                self.arima_model.arima_res_ = self.arima_model.arima_res_.extend(sim, )
+                self.arima_model = self.arima_model.extend(sim, )
             return sim
         else:
             raise("Cannot simulate arima process before fitting the model.")
     
     def _arima_forecast(self, horizon = 24):
         if self.arima_model is not None:
-            forecast = self.arima_model.arima_res_.forecast(steps=horizon).values
-            # forecast = self.arima_model.arima_res_.get_forecast(steps=horizon) # Should be used if we want confidence intervals as well.
+            forecast = self.arima_model.forecast(steps=horizon).values
+            # forecast = self.arima_model.get_forecast(steps=horizon) # Should be used if we want confidence intervals as well.
             return forecast
         else:
             raise("Cannot forecast arima process before fitting the model.")
@@ -164,7 +172,7 @@ class PriceSimulationTool(SimulationTool):
     tool_type = 'price'
     ylabel    = '€/MWh'
 
-    def __init__(self, forecaster):
+    def __init__(self, forecaster, gamma=0.9995):
         super().__init__(forecaster)
         self.log_prices = self.forecaster.log_prices
         self.price_tag  = self.forecaster.price_tag
@@ -172,8 +180,10 @@ class PriceSimulationTool(SimulationTool):
         self.seasonal_price_regression = self.forecaster.seasonal_price_regression
         self.day_night_price_regression = self.forecaster.day_night_price_regression
         self.log_vre    = self.forecaster.log_vre
-        self.y_train = self.forecaster.train_data[[self.price_tag]]
-        self.y_test  = self.forecaster.test_data[[self.price_tag]]
+        self.y_train = self.forecaster.data[[self.price_tag]]
+        self.data = self.forecaster.data.copy() # Historical price data
+        self.sample_weights = [gamma**x for x in range(len(self.data))][::-1] # Weighted linear regression
+        # self.y_test  = self.forecaster.test_data[[self.price_tag]]
 
     def WSS_price_regression(self, df): # Wind-Solar-Season price regression
         """ Create features """
@@ -187,18 +197,18 @@ class PriceSimulationTool(SimulationTool):
             feature_tags = [wind_tag + '-is_day', solar_tag + '-is_day', wind_tag + '-is_night', solar_tag + '-is_night']
         if self.log_vre:
             feature_tags += ['log_' + wind_tag, 'log_' + solar_tag]
-        self.X_train = self.train_data[feature_tags]
-        self.X_test  = self.forecaster.test_data[feature_tags]
+        self.X_train = self.data[feature_tags]
+        # self.X_test  = self.forecaster.test_data[feature_tags]
         self.feature_tags = feature_tags
 
         """ Fit linear model "price(t) = w1 * wind(t) + w2 * solar(t) + ... + eps(t)" """
         wss_model = LinearRegression()
         # wss_model = SVR()
-        wss_model.fit(self.X_train, df)
+        wss_model.fit(self.X_train, df, sample_weight=self.sample_weights)
         merit_order_effect = wss_model.predict(self.X_train)
         residuals = df - merit_order_effect
         if self.verbose: print("Mean squared error of WSS fit (train): ", mean_squared_error(df, merit_order_effect))
-        if self.verbose: print("Mean squared error of WSS fit (validation): ", mean_squared_error(self.y_test, wss_model.predict(self.X_test)))
+        # if self.verbose: print("Mean squared error of WSS fit (validation): ", mean_squared_error(self.y_test, wss_model.predict(self.X_test)))
         if self.documentation:
             self.plot_impact_of_deseason(df,
                                         merit_order_effect - wss_model.intercept_,
@@ -212,9 +222,8 @@ class PriceSimulationTool(SimulationTool):
 
     def _del_trend(self, df):
         trend_model = LinearRegression()
-        hours       = pd.DataFrame({'timestamp': [h.timestamp() - self.forecaster.t_zero for h in self.train_data.index]}, index=self.train_data.index) # Convert to Unix time
-        weights     = [0.9999**x for x in range(len(hours))][::-1] # Weighted linear regression
-        trend_model.fit(hours, df, sample_weight=weights)
+        hours       = pd.DataFrame({'timestamp': [h.timestamp() - self.forecaster.t_zero for h in self.data.index]}, index=self.data.index) # Convert to Unix time
+        trend_model.fit(hours, df, sample_weight=self.sample_weights)
         impact      = trend_model.predict(hours)
         residuals   = df - impact
         if self.documentation: self.plot_impact_of_deseason(df, impact, residuals, name=self.tool_type + "removing_trend_effect")
@@ -231,7 +240,7 @@ class PriceSimulationTool(SimulationTool):
     
     def _del_weekday_and_weekend_pattern(self, df_):
         df = df_.copy()
-        time_info = self.train_data
+        time_info = self.data
         weekend_data = df.loc[time_info.is_weekend, self.price_tag]
         weekday_data = df.loc[time_info.is_weekday, self.price_tag]
         avg_weekend_hours = weekend_data.groupby(weekend_data.index.hour).mean()
@@ -242,9 +251,8 @@ class PriceSimulationTool(SimulationTool):
         df.loc[time_info.is_weekday, self.price_tag] -= weekday_impact
         return df, avg_weekday_hours, avg_weekend_hours
 
-    def fit(self):
-        self.train_data = self.forecaster.train_data.copy() # Historical price data
-        residuals = self.train_data[[self.price_tag]]
+    def fit(self, old_model = None):
+        residuals = self.data[[self.price_tag]]
 
         self.max_historical, self.min_historical = np.max(residuals), np.min(residuals)
 
@@ -255,16 +263,23 @@ class PriceSimulationTool(SimulationTool):
         residuals, self.monthly_avg = self._del_annual_cycle(residuals)
         residuals, self.weekday_avg, self.weekend_avg = self._del_weekday_and_weekend_pattern(residuals)
         
-        residuals                 = self._calculate_rs_probabilities(residuals)
-        self.arima_model          = self._fit_arima_model(residuals, order=(2,0,1), seasonal_order=(1, 0, 0, 24))    
+        residuals            = self._calculate_rs_probabilities(residuals)
+        residuals.index.freq = 'h'
+
+        old_arima_model = None
+        if old_model is not None:
+            old_arima_model = old_model.arima_model
+        # self.arima_model     = self._fit_arima_model(residuals, order=(2,0,1), seasonal_order=(1, 0, 0, 24))
+        self.arima_model     = self._fit_arima_model(residuals, order=(2,0,1), old_model = old_arima_model)
         if self.documentation:
             self.investigate_heteroskedasticity(residuals)
             plot_acf(residuals)
         
     def investigate_heteroskedasticity(self, residuals):
         # Even though we do find that the data is heteroskedastic, log-transforming does not change this at all. So it is ignored.
+        import statsmodels.api as sm
         from statsmodels.stats.diagnostic import het_breuschpagan
-        self.bp_test = het_breuschpagan(residuals, sm.add_constant(self.train_data[[self.forecaster.wind_tag, self.forecaster.solar_tag]]))
+        self.bp_test = het_breuschpagan(residuals, sm.add_constant(self.data[[self.forecaster.wind_tag, self.forecaster.solar_tag]]))
         self.heteroskedastic = self.bp_test[3] < 0.05 # Reject the null-hypothesis of homoskedasticity at a 5% significane threshold.
         # Plot residuals with self and main regressors
         fig, axes = plt.subplots(1, 3, figsize=(15,8), sharey=True)
@@ -272,10 +287,10 @@ class PriceSimulationTool(SimulationTool):
         fig.tight_layout(pad=4.0, rect=[0.03, 0.03, 0.97, 0.95])
         ylabel = 'Residuals' + ('' if self.log_prices else ' [€/MWh]')
         axes[0].set_ylabel(ylabel)
-        axes[0].scatter(self.train_data.index,    residuals, s=1)
+        axes[0].scatter(self.data.index,    residuals, s=1)
         axes[0].set_xticks(axes[0].get_xticks(), labels=axes[0].get_xticklabels(), rotation=45)
-        axes[1].scatter(self.train_data[self.forecaster.wind_tag],  residuals, s=1)
-        axes[2].scatter(self.train_data[self.forecaster.solar_tag], residuals, s=1)
+        axes[1].scatter(self.data[self.forecaster.wind_tag],  residuals, s=1)
+        axes[2].scatter(self.data[self.forecaster.solar_tag], residuals, s=1)
         plt.savefig(f'documentation/{self.forecaster.plot_dir}heteroskedastic_visual.png')
         plt.close()
 
@@ -297,6 +312,7 @@ class PriceSimulationTool(SimulationTool):
         self.rs_prob_matrix *= 1/len(regimes)
         self.price_regime_probabilities = self.rs_prob_matrix.sum(axis=0) # Probability of being in each regime.
         self.rs_prob_matrix = np.transpose(np.transpose(self.rs_prob_matrix) / self.rs_prob_matrix.sum(axis=1)) # Probabilities in each row sum to 1.
+        self.rs_prob_matrix = np.nan_to_num(self.rs_prob_matrix) # If we have a regime that we never observe transitioning from, we set the probabilities of transitioning to each regime from this regime to 0 (instead of NaN).
 
         ### Save info on high and low regimes before removing it from the residual price dataframe.
         high_prices    = prices.iloc[:,0][high_price_regime.astype(bool).iloc[:,0]]
@@ -319,10 +335,10 @@ class PriceSimulationTool(SimulationTool):
 
         self.high_prices = high_prices # The outliers are not normal distributed at all. Sampled from a one-sided laplace distribution later
         self.high_base   = 2 * residual_std + residual_mu
-        self.high_std    = sum(abs(self.high_prices - self.high_base)) / len(high_prices)
+        self.high_std    = sum(abs(self.high_prices - self.high_base)) / max(1, len(high_prices))
         self.low_prices  = low_prices # The outliers are not normal distributed at all. Sampled from a one-sided laplace distribution later
         self.low_base    = -2 * residual_std + residual_mu
-        self.low_std     = sum(abs(self.low_prices - self.low_base)) / len(low_prices)
+        self.low_std     = sum(abs(self.low_prices - self.low_base)) / max(1, len(low_prices))
 
         # Remove extreme residuals from time series and replace with mean
         residuals = prices * (1-high_price_regime)*(1-low_price_regime) + residual_mu * ((high_price_regime) | (low_price_regime))
@@ -440,8 +456,8 @@ class RenewablesSimulationTool(SimulationTool):
 class SolarSimulationTool(RenewablesSimulationTool):
     tool_type = 'solar'
 
-    def fit(self):
-        data = self.forecaster.train_data[[self.vre_tag]].copy()
+    def fit(self, old_model=None):
+        data = self.forecaster.data[[self.vre_tag]].copy()
         # Step 1: Remove effect from added capacities of each year.
         df = self._del_capacity_trend(data) # Produces capacity utilization factor for all timestamps
 
@@ -517,9 +533,10 @@ class SolarSimulationTool(RenewablesSimulationTool):
         daily_std = daily_month_ix.map(self.monthly_std_of_max[self.vre_tag])
         daily_max[self.vre_tag] = daily_max[self.vre_tag] / daily_std
 
-        self.residuals = daily_max
+        self.daily_residuals = daily_max
+        self.daily_residuals.index.freq = 'D'
 
-        if self.documentation: plot_acf(self.residuals)
+        if self.documentation: plot_acf(self.daily_residuals)
         
         # Step 2: Subtract daily profiles
         hour_residuals = df.copy()
@@ -527,12 +544,19 @@ class SolarSimulationTool(RenewablesSimulationTool):
             daily_mean_profile = self.hourly_monthly_mean_profiles.loc[month, self.vre_tag] # Daily profiles
             daily_std_profile = self.hourly_monthly_std_profiles.loc[month, self.vre_tag] # Daily profiles
             hour_residuals.loc[hour_residuals.index.month==month, self.vre_tag] -= hour_residuals.loc[hour_residuals.index.month==month].index.hour.map(daily_mean_profile)
-            hour_residuals.loc[(hour_residuals.index.month==month) & (self.forecaster.train_data.is_day), self.vre_tag] /= hour_residuals.loc[(hour_residuals.index.month==month) & (self.forecaster.train_data.is_day)].index.hour.map(daily_std_profile)
-        
-        self.hourly_arima_model = self._fit_arima_model(hour_residuals, order=(1,0,1), seasonal_order=(1,0,0,24), name="hour")
+            hour_residuals.loc[(hour_residuals.index.month==month) & (self.forecaster.data.is_day), self.vre_tag] /= hour_residuals.loc[(hour_residuals.index.month==month) & (self.forecaster.data.is_day)].index.hour.map(daily_std_profile)
+        hour_residuals.index.freq = 'h'
+
+        # self.hourly_arima_model = self._fit_arima_model(hour_residuals, order=(1,0,1), seasonal_order=(1,0,0,24), name="hour")
+        old_hourly_arima_model = None
+        old_arima_model = None
+        if old_model is not None:
+            old_hourly_arima_model = old_model.hourly_arima_model
+            old_arima_model = old_model.arima_model
+        self.hourly_arima_model = self._fit_arima_model(hour_residuals, order=(1,0,1), name="hour", old_model = old_hourly_arima_model)
 
         # Step 5: Fit arima model to daily max residual data.
-        self.arima_model = self._fit_arima_model(self.residuals, order=(2,0,0))
+        self.arima_model = self._fit_arima_model(self.daily_residuals, order=(2,0,0), old_model = old_arima_model)
 
     def _simulate_cf(self, hourly_index: pd.DatetimeIndex, realize=False, forecasting = False):
         day_index    = pd.date_range(hourly_index[0], hourly_index[-1], freq='d')
@@ -554,11 +578,11 @@ class SolarSimulationTool(RenewablesSimulationTool):
         # Rev. Step 2: Go from daily max to hourly profiles
         n_hours = len(hourly_index)
         if forecasting:
-            sim_hourly_variation = self.hourly_arima_model.arima_res_.forecast(steps=n_hours).values
+            sim_hourly_variation = self.hourly_arima_model.forecast(steps=n_hours).values
         else:
-            sim_hourly_variation = self.hourly_arima_model.arima_res_.simulate(nsimulations=n_hours).values
+            sim_hourly_variation = self.hourly_arima_model.simulate(nsimulations=n_hours).values
             if realize:
-                self.hourly_arima_model.arima_res_ = self.hourly_arima_model.arima_res_.extend(sim_hourly_variation, )
+                self.hourly_arima_model = self.hourly_arima_model.extend(sim_hourly_variation, )
 
         profile = pd.DataFrame(index=hourly_index, data={self.vre_tag : sim_hourly_variation})
         for month in profile.index.month.unique():
@@ -575,7 +599,7 @@ class SolarSimulationTool(RenewablesSimulationTool):
             profile.loc[ix, self.vre_tag] = day_profile
         
         if self.documentation:
-            data = self.forecaster.train_data[[self.vre_tag]]
+            data = self.forecaster.data[[self.vre_tag]]
             df_hist = self._del_capacity_trend(data)
             plt.plot(np.sort(profile[self.vre_tag]), color='red')
             for year in df_hist.index.year.unique():
@@ -656,9 +680,9 @@ class WindSimulationTool(RenewablesSimulationTool):
 
     def fit(self):
         # Step 1: Remove effect from added capacities of each year.
-        data = self.forecaster.train_data[[self.vre_tag]].copy()
+        data = self.forecaster.data[[self.vre_tag]].copy()
         capacity_factors = self._del_capacity_trend(data)
-        data_solar = self.forecaster.train_data[['solar']].copy()
+        data_solar = self.forecaster.data[['solar']].copy()
         capacity_factors_solar = self.forecaster.solar_model._del_capacity_trend(data_solar)
         self.min_historical_production = np.min(capacity_factors)
         self.max_historical_production = np.max(capacity_factors)
@@ -1042,7 +1066,7 @@ class WindSimulationTool(RenewablesSimulationTool):
         profile[self.vre_tag] += (profile[self.vre_tag] < self.min_historical_production) * ((self.min_historical_production-profile[self.vre_tag]) + np.random.exponential(abs(self.pol_model_pos(self.min_historical_production)),size=len(profile)))
 
         if self.documentation:
-            data = self.forecaster.train_data[[self.vre_tag]]
+            data = self.forecaster.data[[self.vre_tag]]
             df_hist = self._del_capacity_trend(data)
             plt.plot(np.sort(profile[self.vre_tag]), color='red')
             for year in df_hist.index.year.unique():
@@ -1106,6 +1130,7 @@ class DataForecaster:
                  cache_id = None,
                  cache_replace = False,
                  from_pickle = False,
+                #  create_train_test_data = True,
                  ):
         """ Initialize and set up train and test data. """
         if from_pickle:
@@ -1133,7 +1158,10 @@ class DataForecaster:
             if not os.path.exists(dn):
                 os.mkdir(dn)
             self.cache_id, self.cache_replace = cache_id, cache_replace
-            self.create_train_test_data()
+            self.t_zero = self.data.index[0].timestamp() # To be used when fitting trend and later on when reapplying trend.
+            self.t_init = self.data.index[-1] + pd.Timedelta(1, 'hour')
+            # if create_train_test_data:
+            #     self.create_train_test_data()
     
     def unpickle(self, documentation=False):
         if hasattr(self, 'unpickled'):
@@ -1145,26 +1173,39 @@ class DataForecaster:
         else:
             raise AttributeError("No unpickled object found. Please initialize with from_pickle=True.")
 
-    def build_simulation_models(self, to_pickle=False):
+    def build_simulation_models(self, to_pickle=False, old_forecaster=None):
         # Build time series models:
+        old_solar_model = None
+        old_price_model = None
+        if old_forecaster is not None: # Then warmstart the ARIMA models.
+            old_solar_model = old_forecaster.solar_model
+            old_price_model = old_forecaster.price_model
         self.solar_model = SolarSimulationTool(self, caps=self.database.caps, vre_tag=self.solar_tag, weather_years=False)
-        self.solar_model.fit()
+        self.solar_model.fit(old_solar_model)
         self.wind_model  = WindSimulationTool(self, caps=self.database.caps, vre_tag=self.wind_tag, weather_years=self.weather_years)
         self.wind_model.fit()
         self.price_model = PriceSimulationTool(self)
-        self.price_model.fit()
+        self.price_model.fit(old_price_model)
         self.solar_realization_cf, self.solar_realization_cf = None, None
         if to_pickle:
             cache_path = os.getcwd() + "/models/ts_models/forecaster/" + str(self.cache_id) + ".pkl"
             if self.cache_id is not None: cache_write(self, cache_path, verbose=self.verbose)
 
-    def create_train_test_data(self):
-        ## Train and test split and y (prices) and X (renewables).
-        self.train_data, self.test_data = pm.model_selection.train_test_split(self.data, test_size=8760) # A full year of test data, should be at least two years of data.
-        # self.y_train, self.y_test = self.train_data[[self.price_tag]], self.test_data[[self.price_tag]]
-        # self.X_train, self.X_test = self.train_data[feature_tags], self.test_data[feature_tags]
-        self.t_zero = self.train_data.index[0].timestamp() # To be used when fitting trend and later on when reapplying trend.
-        self.t_init = self.train_data.index[-1] + pd.Timedelta(1, 'hour')
+    # def create_train_test_data(self, test_size=0):
+    #     ## Train and test split and y (prices) and X (renewables).
+    #     def train_test_split(df, test_size):
+    #         # train_data = df.iloc[:-test_size]
+    #         train_data = df
+    #         if test_size > 0:
+    #             test_data = df.iloc[-test_size:]
+    #         else:
+    #             test_data = pd.DataFrame(columns=df.columns) # Empty dataframe with same columns as df
+    #         return train_data, test_data
+    #     self.train_data, self.test_data = train_test_split(self.data, test_size=test_size) # A full year of test data, should be at least two years of data.
+    #     # self.y_train, self.y_test = self.train_data[[self.price_tag]], self.test_data[[self.price_tag]]
+    #     # self.X_train, self.X_test = self.train_data[feature_tags], self.test_data[feature_tags]
+    #     self.t_zero = self.train_data.index[0].timestamp() # To be used when fitting trend and later on when reapplying trend.
+    #     self.t_init = self.train_data.index[-1] + pd.Timedelta(1, 'hour')
 
     def set_seed(self, seed):
         self.seed = seed
@@ -1292,14 +1333,17 @@ class DataForecaster:
                 solar_forecast_cf = self.solar_model.simulate(hourly_index=vre_forecast_index)
                 wind_forecast_cf  = self.wind_model.simulate(hourly_index=vre_forecast_index, solar_cf_profile=solar_forecast_cf)[self.wind_tag]
                 solar_forecast_cf = solar_forecast_cf[self.solar_tag]
-            solar_production  = pd.concat([self.solar_realization_cf[self.solar_tag], solar_forecast_cf]) * solar_capacities.values
-            wind_production   = pd.concat([self.wind_realization_cf[self.wind_tag], wind_forecast_cf]) * wind_capacities.values
+            if (self.solar_realization_cf is not None) and (self.wind_realization_cf is not None):
+                solar_forecast_cf  = pd.concat([self.solar_realization_cf[self.solar_tag], solar_forecast_cf])
+                wind_forecast_cf   = pd.concat([self.wind_realization_cf[self.wind_tag], wind_forecast_cf])
+            solar_production  = solar_forecast_cf * solar_capacities.values
+            wind_production   = wind_forecast_cf * wind_capacities.values
+            df.loc[hourly_index, self.solar_tag] = solar_forecast_cf
+            df.loc[hourly_index, self.wind_tag]  = wind_forecast_cf
             if simulate_prices and ix > 0: # Useful only if we simulate more scenarios where the effect of extreme prices might be desirable to include
                 price_forecast    = self.price_model.simulate(pd.DataFrame(index=hourly_index, data = {self.solar_tag: solar_production.values, self.wind_tag: wind_production.values}))
             else:
                 price_forecast    = self.price_model.forecast(pd.DataFrame(index=hourly_index, data = {self.solar_tag: solar_production.values, self.wind_tag: wind_production.values}))
-            df.loc[hourly_index, self.solar_tag] = pd.concat([self.solar_realization_cf[self.solar_tag], solar_forecast_cf])
-            df.loc[hourly_index, self.wind_tag]  = pd.concat([self.wind_realization_cf[self.wind_tag], wind_forecast_cf])
             df.loc[hourly_index, self.price_tag] = price_forecast[self.price_tag]
             forecasts.append(df)
         if deterministic: # We average the simulated futures instead of returning all of them. Will likely ruin the crosscorrelation.
@@ -1312,7 +1356,7 @@ class DataForecaster:
         return forecasts
 
     def investigate_test_simulation_monthly(self, simulations, resource='price'):
-        real_data = self.test_data[resource]
+        real_data = self.data[resource]
         simulated_data = [sim[resource] for sim in simulations]
         year = simulated_data[0].index.year[0]
         if resource == 'price':
@@ -1353,7 +1397,7 @@ class DataForecaster:
 
     def investigate_annual_duration_curves(self, simulations, resource='price'):
         plt.figure(figsize=(10, 6))
-        train_data = self.train_data[resource]
+        train_data = self.data[resource]
         simulated_data = [sim[resource] for sim in simulations]
 
         if resource == 'price':
@@ -1373,13 +1417,13 @@ class DataForecaster:
         for yr in train_data.index.year.unique():
             plt.plot(np.sort(train_data.loc[train_data.index.year==yr]), label=yr, alpha=0.8)
 
-        test_data = self.test_data[resource]
-        plt.plot(np.sort(test_data), label=test_data.index.year.unique(), color='black', alpha=0.8)
-        plt.xlabel("Hours")
-        plt.ylabel(ylabel)
+        # test_data = self.test_data[resource]
+        # plt.plot(np.sort(test_data), label=test_data.index.year.unique(), color='black', alpha=0.8)
+        # plt.xlabel("Hours")
+        # plt.ylabel(ylabel)
 
-        txt = "Mean Price" if resource == 'price' else "Mean Production [MW]"
-        plt.annotate(f'{txt}:\nTraining set: {np.mean(train_data):.2f}\nValidation set: {np.mean(test_data):.2f}\nSim: {np.mean(simulated_data):.2f}', xy=(0.25, 0.75), xycoords='axes fraction', bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", lw=1))
+        txt = "Mean Price" if resource == 'price' else "Mean Production [MW]" # Validation set: {np.mean(test_data):.2f}\n
+        plt.annotate(f'{txt}:\nTraining set: {np.mean(train_data):.2f}\nSim: {np.mean(simulated_data):.2f}', xy=(0.25, 0.75), xycoords='axes fraction', bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", lw=1))
 
         plt.legend()
         plt.savefig(f'documentation/{self.plot_dir}annual_duration_curve_{resource}.png')

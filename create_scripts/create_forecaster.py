@@ -9,13 +9,14 @@ import pandas as pd
 from data_scripts import DataForecaster, HistoricalData
 
 #%% Data retrieval - There is only data from 2015 and forward for Portugal
-start   = pd.Timestamp('20160101', tz='UTC')
-end     = pd.Timestamp('20201231', tz='UTC')
+start   = pd.Timestamp('20150101', tz='UTC')
+end     = pd.Timestamp('20251231', tz='UTC')
 data_object = HistoricalData(start=start, end=end, country_code='PT', server='ENTSOE')
+data_object.data = data_object.data.loc[(data_object.data.index.minute==0)] # Remove 2025 quarterly data, we only want hourly data for forecasting.
 
 #%% Forecasting setup
 forecaster = DataForecaster(data_object,
-                            cache_id="v2",
+                            cache_id="Anders",
                             verbose=False, # Takes under 10 minutes to create, set verbose equals True to see progress, but know that verbose=True for the unpickled object.
                             cache_replace=True,
                             )

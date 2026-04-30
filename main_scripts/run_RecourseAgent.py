@@ -21,7 +21,8 @@ def main():
     
     n_episodes = 1
     
-    env = get_env(RFPRecourseEnv, allow_spot_buy=allow_spot_buy, balancing_market=True, verbose=True, load_data=True)
+    env_config = {"allow_spot_buy": allow_spot_buy, "balancing_market": True, "verbose": True, "load_data": True, "inflexible": False}
+    env = get_env(RFPRecourseEnv, env_config=env_config, layout_file="rfp_layout - resized.xlsx")
 
     agent = RecourseAgent(env=env, solver=solver, planning_horizon=planning_horizon, guideline=guideline, n_scenarios=n_scenarios)
 

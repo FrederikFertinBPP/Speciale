@@ -3,7 +3,7 @@ import gymnasium as gym
 import numpy as np
 import pandas as pd
 from collections import deque
-from common_scripts.utils import cache_read
+from common_scripts.utils import cache_read, expando
 from common_scripts.RFP_initialization import RenewableFuelPlant, create_rfp
 from data_scripts.data_generator_v2 import DataForecaster
 from sklearn.preprocessing import MinMaxScaler
@@ -14,27 +14,25 @@ import os
 from model_scripts.hourly_models import ShieldLPModel, HourlyDeterministicLPModel, HourlyRecourseModel, ShieldRecourseModel
 
 def get_env(env_class:gym.Env,
-            allow_spot_buy=True,
-            balancing_market=False,
-            verbose=False,
-            load_data=False,
+            env_config:dict={},
             scenario_name:str="default",
+            data_cache_id:str="Anders",
+            layout_file:str="rfp_layout.xlsx",
             ):
-    rfp = create_rfp(scenario_name=scenario_name)
+    rfp = create_rfp(scenario_name=scenario_name, layout_file=layout_file)
 
-    forecaster = DataForecaster(from_pickle=True, cache_id="Anders")
+    forecaster = DataForecaster(from_pickle=True, cache_id=data_cache_id)
     forecaster = forecaster.unpickle()
     forecaster.t_init = forecaster.test_data.index[0]
-
-    ### Scenario specification: Could be predefined in excel file.
-    # if allow_spot_buy:
-    #     rfp.get_contract('Ammonia1').parameters['volume'] = rfp.get_component("Haber Bosch Plant").parameters.get('capacity') * 8760 / (2 if allow_spot_buy else 5)  # 50% capacity contracted
-
-    env = env_class(rfp=rfp, forecaster=forecaster, decision_horizon=24,
-                    allow_spot_buy = allow_spot_buy, verbose=verbose,
-                    balancing_market=balancing_market, load_data=load_data,
-                    )
-
+    if env_config.get("load_data", False):
+        forecaster_shell = expando()
+        forecaster_shell.t_init = forecaster.t_init
+        forecaster_shell.cache_id = forecaster.cache_id
+        forecaster_shell.database = forecaster.database
+        forecaster = forecaster_shell
+    
+    env = env_class(rfp=rfp, forecaster=forecaster, decision_horizon=24, **env_config)
+    
     return env
 
 
@@ -55,7 +53,7 @@ class VRESystemToAssetMapping:
         return np.clip(self.model(*args, **kwds), 0, 1)
 
 
-class RFPShieldEnv(gym.Env):
+class RFPBaseEnv(gym.Env):
     """ Environment, which allows for operating a Renewable Fuel Plant in a rolling horizon fashion. """
     realization_memory_size = 24
     
@@ -64,6 +62,7 @@ class RFPShieldEnv(gym.Env):
                  forecaster:DataForecaster = None,
                  decision_horizon:int = 24, # Unit: hours
                  allow_spot_buy = True,
+                 inflexible:bool = False,
                  normalize:bool = False,
                  verbose:bool = False,
                  balancing_market:bool = False,
@@ -78,12 +77,13 @@ class RFPShieldEnv(gym.Env):
         self.original_forecaster = forecaster
         self.decision_horizon = decision_horizon # Decision horizon in hours
         self.allow_spot_buy = allow_spot_buy
+        self.inflexible = inflexible
         # Whether to normalize the state and action spaces (dependent on the algorithm used for decision-making)
         # Should maybe be set by the agent instead?
         self.normalize_step = normalize
         self.balancing_market = balancing_market
         self.load_data = load_data
-        self.scenario_name = "" if (forecaster is None) else forecaster.cache_id
+        self.data_cache_id = "" if (forecaster is None) else forecaster.cache_id
         self.scenario_number = -1
         self.verbose = verbose
 
@@ -116,15 +116,6 @@ class RFPShieldEnv(gym.Env):
             self.action_identity += ['dayahead-ElectricitySpot-ba_buy', 'dayahead-ElectricitySpot-ba_sell']
         
         self._set_observation_space()
-
-        shield_class = ShieldRecourseModel if self.balancing_market else ShieldLPModel
-        self.shield = shield_class(self,
-                                    rfp,
-                                    decision_horizon=decision_horizon,
-                                    solver='gurobi',
-                                    allow_spot_buy=allow_spot_buy,
-                                    )
-        self.shield.initialize_model()
         
         """ Define the action space """
         # The action space consists of four actions:
@@ -173,6 +164,7 @@ class RFPShieldEnv(gym.Env):
                          "forecaster": forecaster_id,
                          "balancing_market": balancing_market,
                          "allow_spot_buy": self.allow_spot_buy,
+                         "inflexible": inflexible,
                         }
 
     def _set_state_space(self):
@@ -294,7 +286,6 @@ class RFPShieldEnv(gym.Env):
                 if availability_frequency=='yearly':
                     a[t] = int(time.is_year_end and time.hour == 23)
             availabilities.append(a)
-        
         self.offtaker_context = np.transpose(np.asarray(availabilities))
 
     def _set_price_context(self):
@@ -373,8 +364,8 @@ class RFPShieldEnv(gym.Env):
         if options is not None:
             self.scenario_number = options.get("scenario_number", self.scenario_number)
         
-        self.scenario_path = f"scenario_data/{self.scenario_name}_scenario_{self.scenario_number}/"
-
+        self.scenario_path = f"scenario_data/{self.data_cache_id}_scenario_{self.scenario_number}/"
+        
         self.realized_prices    = deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size)
         self.realized_ppa       = [deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size) for _ in range(self.observation_space["context"]["ppas"].shape[1])]
         self.realized_emissions = deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size)
@@ -391,35 +382,6 @@ class RFPShieldEnv(gym.Env):
         self.episode_unix_start = get_unix_time()
 
         return obs, info
-
-    def activate_shield(self, action):
-        """ Solve flows for the next 24 hours of operation with fixed decisions.
-            We are realizing the plant operation and changing setpoints only when current solution is infeasible.
-        """
-        # Set up dictionaries:
-        supplier_cf = {}
-        for ix, (name, ppa) in enumerate(self.rfp.get_ppas().items()):
-            cf = {(name, t): self.ppa_context[t,ix] for t in range(self.decision_horizon)}
-            supplier_cf = {**supplier_cf, **cf}
-        time_index = pd.to_datetime(pd.date_range(start=self.time, end=self.time+pd.Timedelta(self.decision_horizon-1, 'h'), freq='h'), utc=True)
-        datetime_data = {t: time_index[t] for t in range(self.decision_horizon)}
-
-        # Chosen actions
-        chosen_actions = {(name, t): action[t, ix] for ix, name in enumerate(self.action_identity) for t in range(self.decision_horizon)}
-
-        data = { # Set up the necessary data for the LP Concrete Model
-            None: {
-                'T_datetime': datetime_data,
-                'init_soc': dict(zip(self.storage_names, self.storage_state)),
-                'supplier_cf': supplier_cf,
-                'init_contract_status' : dict(zip(self.contract_names, self.contract_state)),
-                'chosen_actions': chosen_actions,
-            }
-        }
-
-        self.shield.build_concrete_instance(data=data)
-        self.shield.run(verbose=False)
-        return self.shield.get_actions()
 
     def _get_prices_and_emissions_for_step(self, horizon, terminated):
         # Realize prices - already done when context is set.
@@ -496,6 +458,60 @@ class RFPShieldEnv(gym.Env):
         
         return reward, info
 
+
+class RFPShieldEnv(RFPBaseEnv):
+    def __init__(self,
+                 rfp:RenewableFuelPlant,
+                 forecaster:DataForecaster = None,
+                 decision_horizon:int = 24, # Unit: hours
+                 allow_spot_buy = True,
+                 inflexible:bool = False,
+                 normalize:bool = False,
+                 verbose:bool = False,
+                 balancing_market:bool = False,
+                 load_data = True,
+                 **kwargs,
+                 ):
+        super().__init__(rfp, forecaster, decision_horizon, allow_spot_buy, inflexible, normalize, verbose, balancing_market, load_data, **kwargs)
+        shield_class = ShieldRecourseModel if self.balancing_market else ShieldLPModel
+        self.shield = shield_class(self,
+                                    rfp,
+                                    decision_horizon=decision_horizon,
+                                    solver='gurobi',
+                                    allow_spot_buy=allow_spot_buy,
+                                    inflexible=inflexible,
+                                    )
+        self.shield.initialize_model()
+
+    def activate_shield(self, action):
+        """ Solve flows for the next 24 hours of operation with fixed decisions.
+            We are realizing the plant operation and changing setpoints only when current solution is infeasible.
+        """
+        # Set up dictionaries:
+        supplier_cf = {}
+        for ix, (name, ppa) in enumerate(self.rfp.get_ppas().items()):
+            cf = {(name, t): self.ppa_context[t,ix] for t in range(self.decision_horizon)}
+            supplier_cf = {**supplier_cf, **cf}
+        time_index = pd.to_datetime(pd.date_range(start=self.time, end=self.time+pd.Timedelta(self.decision_horizon-1, 'h'), freq='h'), utc=True)
+        datetime_data = {t: time_index[t] for t in range(self.decision_horizon)}
+
+        # Chosen actions
+        chosen_actions = {(name, t): action[t, ix] for ix, name in enumerate(self.action_identity) for t in range(self.decision_horizon)}
+
+        data = { # Set up the necessary data for the LP Concrete Model
+            None: {
+                'T_datetime': datetime_data,
+                'init_soc': dict(zip(self.storage_names, self.storage_state)),
+                'supplier_cf': supplier_cf,
+                'init_contract_status' : dict(zip(self.contract_names, self.contract_state)),
+                'chosen_actions': chosen_actions,
+            }
+        }
+
+        self.shield.build_concrete_instance(data=data)
+        self.shield.run(verbose=False)
+        return self.shield.get_actions()
+
     def _step(self, action):
         """
         Perform a step in the environment with the given action.
@@ -550,14 +566,14 @@ class RFPShieldEnv(gym.Env):
 
 
 class RFPYearEnv(RFPShieldEnv):
-    def __init__(self, rfp, forecaster = None, allow_spot_buy=True, normalize = False, verbose = False, load_data=True, **kwargs):
+    def __init__(self, rfp, forecaster = None, allow_spot_buy=True, inflexible=False, normalize = False, verbose = False, load_data=True, **kwargs):
         self.original_forecaster = forecaster
         t = self.original_forecaster.t_init
         t_end = self.original_forecaster.t_init + relativedelta(years=+1) # Episodic implementation
         horizon = (t_end - t).days * 24 # Number of hours in the year.
         self.realization_memory_size = horizon
-        super().__init__(rfp, forecaster, decision_horizon=horizon, allow_spot_buy=allow_spot_buy, normalize=normalize, verbose=verbose, load_data=load_data)
-        self.pfm = HourlyDeterministicLPModel(rfp, decision_horizon=horizon, solver='gurobi', allow_spot_buy=allow_spot_buy)
+        super().__init__(rfp, forecaster, decision_horizon=horizon, allow_spot_buy=allow_spot_buy, inflexible=inflexible, normalize=normalize, verbose=verbose, load_data=load_data)
+        self.pfm = HourlyDeterministicLPModel(rfp, decision_horizon=horizon, solver='gurobi', allow_spot_buy=allow_spot_buy, inflexible=inflexible)
         self.pfm.initialize_model()
 
     def _set_ppa_context(self):
@@ -636,7 +652,7 @@ class RFPYearEnv(RFPShieldEnv):
         return reward, info
 
 
-class RFPEnv(RFPShieldEnv):
+class RFPModelActionsEnv(RFPBaseEnv):
     step_with_hourly_model = True
 
     def _step(self, action, hourly_model):
@@ -691,7 +707,7 @@ class RFPEnv(RFPShieldEnv):
             return self._step(action, hourly_model)
 
 
-class RFPRecourseEnv(RFPEnv):
+class RFPRecourseEnv(RFPModelActionsEnv):
     balancing_market = True
     realization_memory_size = 36
     
@@ -760,4 +776,98 @@ class RFPRecourseEnv(RFPEnv):
         info["terminates_next"] = self.time + pd.Timedelta(self.decision_horizon, 'h') >= self.episode_end
         return obs, reward, terminated, truncated, info
 
+
+class RFPBackcastEnv(RFPModelActionsEnv):
+    def _step(self, action, hourly_model):
+        obs, reward, terminated, truncated, info = super()._step(action, hourly_model)
+        info["forecast_path"] = self.forecast_path
+        truncated = self.truncated
+        return obs, reward, terminated, truncated, info
+
+    def reset(self, *, seed: int | None = None, options = None):
+        """
+        Reset the environment to its initial state.
+        Returns:
+            tuple: The initial state of the environment, and additional info.
+        """
+        # Reset core and stochastic components of environment:
+        gym.Env.reset(self, seed=seed)
+
+        filename = "historical_data/clean_dataframes/backcasting_timeseries.csv"
+        self.time = pd.Timestamp('2017-01-01 00:00:00')
+        self.forecaster_type = "forecaster"
+        if options is not None:
+            filename = options.get("historical_data_path", filename)
+            self.time = options.get("episode_start", self.time)
+            self.forecaster_type = options.get("forecaster_type", self.forecaster_type) # Options: ("forecaster", "prophet", "persistence")
+        self.historical_data = pd.read_csv(filename, index_col=0, parse_dates=True)
+        self.historical_data.index = self.historical_data.index.tz_localize(None)
+        self.episode_end = self.historical_data.index[-1]
+
+        self.forecast_path = f"scenario_data/Historicals/{self.forecaster_type}/"
+        
+        self.realized_prices    = deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size)
+        self.realized_ppa       = [deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size)
+                                   for _ in range(self.observation_space["context"]["ppas"].shape[1])]
+        self.realized_emissions = deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size)
+
+        # --- Reset state ---
+        self.storage_state = self.storage_state_space.low
+        self.contract_state = self.contract_state_space.low
+
+        # --- Reset context ---
+        self.truncated = False
+        self._set_context()
+
+        obs = self._get_obs()
+        info = {"time": self.time, "forecast_path": self.forecast_path,}
+        self.episode_unix_start = get_unix_time()
+
+        return obs, info
+
+    def _set_ppa_context(self):
+        # Realize VRE PPA availability for the next decision horizon (typically 24 hours)
+        hist_slice = self.historical_data.loc[self.time:self.time+pd.Timedelta(self.decision_horizon-1,'h')]
+        self.system_solar_realization, self.system_wind_realization = hist_slice['solar'].values, hist_slice['wind'].values
+
+        for ix, (name, ppa) in enumerate(self.rfp.get_ppas().items()):
+            if ppa.parameters.get("consumes") == 'wind':
+                cf = self.wind_mapper(self.system_wind_realization)
+            elif ppa.parameters.get("consumes") == 'solar':
+                cf = self.solar_mapper(self.system_solar_realization)
+            else:
+                cf = np.ones(len(self.system_solar_realization)) # Assumes full availability of non-variable PPAs.
+            self.realized_ppa[ix].extend(cf)
+        self.ppa_context = np.transpose(np.asarray(self.realized_ppa))
+
+    def _set_price_context(self):
+        # Realize prices - updates the forecaster object by including the new realizations.
+        try:
+            timestamp_str = self.time.strftime("%Y-%m-%d")
+            price_forecast = pd.read_csv(f"scenario_data/Historicals/{self.forecaster_type}/forecast_{timestamp_str}.csv", usecols=["price"], nrows=24)
+            self.price_context = price_forecast['price'].values
+        except FileNotFoundError:
+            self.truncated = True
+        hist_slice = self.historical_data.loc[self.time:self.time+pd.Timedelta(self.decision_horizon-1,'h')]
+        self.realized_prices.extend(hist_slice['price'].values)
+
+    def _set_emissions_context(self):
+        # This where we map from simulated wind, solar, and prices or we draw from pregenerated scenario file.
+        # hourly_index = pd.to_datetime(pd.date_range(self.time, self.time + pd.Timedelta(self.decision_horizon-1, 'hour'), freq='h'), utc=True)
+        # year_month_index = hourly_index.tz_localize(None).to_period('M')
+        # solar_capacities = year_month_index.map(self.forecaster.database.caps['solar'])
+        # wind_capacities = year_month_index.map(self.forecaster.database.caps['wind'])
+        # solar = self.system_solar_realization * solar_capacities
+        # wind = self.system_wind_realization * wind_capacities
+        # forecast_prices = self.price_context
+        # X_forecast = pd.DataFrame(data={"price":forecast_prices, "wind":wind, "solar":solar})
+        # forecast_emissions = self.emissions_model(X_forecast) / 1000 # Convert to unit tCO2/MWh.
+        real_emissions = self.historical_data.loc[self.time:self.time+pd.Timedelta(self.decision_horizon-1,'h'),"emissions"].values / 1000 # Convert to unit tCO2/MWh.
+
+        self.realized_emissions.extend(real_emissions)
+        self.emissions_context = self.context_space["emissions"].low
+
+
+class RFPBackcastRecourseEnv(RFPBackcastEnv,RFPRecourseEnv):
+    pass
 

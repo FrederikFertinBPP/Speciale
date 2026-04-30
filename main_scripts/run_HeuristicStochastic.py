@@ -7,7 +7,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from common_scripts import train # stats, trajectories = train(env, agent, num_episodes=n_episodes, verbose=True, seed=42)
-from model_scripts.environment import RFPShieldEnv, RFPEnv, get_env
+from model_scripts.environment import RFPShieldEnv, RFPModelActionsEnv, get_env
 from model_scripts.agent_hierarchical_heuristic import StochasticHA
 
 def main():
@@ -22,7 +22,8 @@ def main():
     
     n_episodes = 50
     
-    env = get_env(RFPEnv, allow_spot_buy=True, balancing_market=False, verbose=True, load_data=True)
+    env_config = {"allow_spot_buy": allow_spot_buy, "balancing_market": False, "verbose": True, "load_data": True, "inflexible": False}
+    env = get_env(RFPModelActionsEnv, env_config=env_config, layout_file="rfp_layout - resized.xlsx")
 
     agent = StochasticHA(env=env, solver=solver, planning_horizon=planning_horizon, guideline=guideline, n_scenarios=n_price_scenarios)
 

@@ -259,8 +259,8 @@ class RenewableFuelPlant():
         """ Returns the RFP information as a dict. """
         return self.__dict__
 
-def load_input_data():
-    xls_path = os.path.abspath('./setup_files/hpp_layout.xlsx')
+def load_input_data(layout_file:str = "rfp_layout.xlsx"):
+    xls_path = os.path.abspath('./setup_files/' + layout_file)
     df_components = pd.read_excel(xls_path, sheet_name="Components")
     df_contracts = pd.read_excel(xls_path, sheet_name="Contracts")
     df_carriers = pd.read_excel(xls_path, sheet_name="Carriers")
@@ -268,12 +268,12 @@ def load_input_data():
     scenario_info = pd.read_excel(xls_path, sheet_name="Scenarios")
     return df_components, df_contracts, df_carriers, df_ppas, scenario_info
 
-def create_rfp(scenario_name:str = "default") -> RenewableFuelPlant:
+def create_rfp(scenario_name:str = "default", layout_file:str = "rfp_layout.xlsx") -> RenewableFuelPlant:
     """
     Create a renewable fuel plant with defined components (i.e. fixed capacities and such) and contracts.
     """
     rfp = RenewableFuelPlant()
-    df_components, df_contracts, df_carriers, df_ppas, scenario_info = load_input_data()
+    df_components, df_contracts, df_carriers, df_ppas, scenario_info = load_input_data(layout_file=layout_file)
     
     for _, row in df_carriers.iterrows():
         rfp.add_carrier(Carrier(name=row["name"]))

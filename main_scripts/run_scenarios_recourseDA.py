@@ -21,6 +21,8 @@ def main():
 
     n_episodes = 20
 
+    env_config = {"allow_spot_buy": allow_spot_buy, "balancing_market": True, "verbose": True, "load_data": True, "inflexible": False}
+
     # scenarios = ["80percent_ammonia", "70percent_ammonia", ]
     # scenarios += ["60percent_ammonia", "50percent_ammonia", ]
     # scenarios += ["40percent_ammonia", "no_solar_power", "high_RE_level"]
@@ -28,9 +30,9 @@ def main():
     scenarios = ["base_case_no_spot", "no_solar_power", "high_RE_level"]
     scenarios = ["no_solar_power", "high_RE_level"]
     scenarios = ["high_RE_level"]
-
+    
     for scenario in scenarios:
-        env = get_env(RFPRecourseEnv, allow_spot_buy=allow_spot_buy, balancing_market=True, verbose=True, load_data=True, scenario_name=scenario)
+        env = get_env(RFPRecourseEnv, env_config=env_config, scenario_name=scenario)
         
         agent = RecourseAgent(env=env, solver=solver, planning_horizon=planning_horizon, guideline=guideline,
                               n_scenarios=n_scenarios)

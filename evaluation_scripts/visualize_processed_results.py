@@ -70,16 +70,24 @@ set_plotting_style()
 # colors = ['blue'] + ['green'] + 3*['lightgreen'] + ['orange']  # Customize as needed
 # documentation_dir = "intraday_bidding_strategies"
 
-""" PPA only """
-scenarios = ["base_case_no_spot", "no_solar_power", "high_RE_level"]
-agents = ("DeterministicHA_production_value_ph_72_spot_False",
-            "RecourseAgent1_production_value_ph_72_spot_False",
-            "StrikePriceBiddingAgent1_SP1_production_value_ph_72_spot_False",
-)
-experiments = [f"scenario_{scenario}_{agent}" for scenario in scenarios for agent in agents]
-palette = sns.color_palette("colorblind")
-colors = len(scenarios)*palette[:len(agents)]
-documentation_dir = "ppa_only_results"
+# """ PPA only """
+# scenarios = ["base_case_no_spot", "no_solar_power", "high_RE_level"]
+# agents = ("DeterministicHA_production_value_ph_72_spot_False",
+#             "RecourseAgent1_production_value_ph_72_spot_False",
+#             "StrikePriceBiddingAgent1_SP1_production_value_ph_72_spot_False",
+# )
+# experiments = [f"scenario_{scenario}_{agent}" for scenario in scenarios for agent in agents]
+# palette = sns.color_palette("colorblind")
+# colors = len(scenarios)*palette[:len(agents)]
+# documentation_dir = "ppa_only_results"
+
+""" Planning strategy investigations """
+experiments = ("minload_pwl_DeterministicHA_production_value_ph_96_spot_True_small",
+                    "minload_pwl_ramp_DeterministicHA_production_value_ph_96_spot_True_small",
+                    "planningsensitivity_DeterministicHA_production_value_ph_96_spot_True_small",
+                    "test_AggregateFullHorizonAgent_ph_96_spot_True_small")
+colors = ['skyblue', 'steelblue', 'lightcoral', 'indigo']  # Customize as needed
+documentation_dir = "planning_strategy_comparison"
 
 exp_ebitda = {}
 VaR_90_ebitda = {}

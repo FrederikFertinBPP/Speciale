@@ -1,5 +1,6 @@
 import os, glob, csv
-import pickle
+# import pickle
+# import joblib
 import numpy as np
 from collections import namedtuple
 from collections.abc import Iterable
@@ -34,14 +35,15 @@ class expando(object):
     pass
 
 def cache_write(object, file_name, verbose=True):
-    import lzma
+    import joblib
     dn = os.path.dirname(file_name)
     if not os.path.exists(dn):
         os.mkdir(dn)
     if verbose: print("Writing cache...", file_name)
-    with lzma.open(file_name, 'wb') as f:
-        pickle.dump(object, f)
-        # compress_pickle.dump(object, f, compression="lzma", protocol=protocol)
+    # with lzma.open(file_name, 'wb') as f:
+    #     pickle.dump(object, f)
+    #     # compress_pickle.dump(object, f, compression="lzma", protocol=protocol)
+    joblib.dump(object, file_name, compress=('lzma', 3))  # streams, doesn't buffer all in RAM
     if verbose:
         print("Done!")
 
@@ -49,12 +51,12 @@ def cache_exists(file_name):
     return os.path.exists(file_name)
 
 def cache_read(file_name):
-    import lzma
+    import joblib
     if os.path.exists(file_name):
-        with lzma.open(file_name, 'rb') as f:
-            return pickle.load(f)
-    else:
-        return None
+        # with lzma.open(file_name, 'rb') as f:
+        #     return pickle.load(f)
+        return joblib.load(file_name)
+    return None
 
 ## Helper functions for saving/loading a time series
 def load_time_series(experiment_name, exclude_empty=True):

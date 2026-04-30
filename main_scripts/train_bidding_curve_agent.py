@@ -14,7 +14,8 @@ def main():
     solver = 'gurobi'
     allow_spot_buy = True
     
-    env = get_env(RFPYearEnv, allow_spot_buy=allow_spot_buy, balancing_market=False, verbose=True, load_data=True)
+    env_config = {"allow_spot_buy": allow_spot_buy, "balancing_market": False, "verbose": True, "load_data": True, "inflexible": False}
+    env = get_env(RFPYearEnv, env_config=env_config, layout_file="rfp_layout - resized.xlsx")
 
     agent = BiddingCurveAgent(env=env, solver=solver, documentation=False, guideline=None,
                               n_price_domains=1)

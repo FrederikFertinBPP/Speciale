@@ -16,10 +16,11 @@ def main():
     allow_spot_buy = True
     n_scenarios = 1
     guideline = "production_value"
-
-    env = get_env(RFPRecourseEnv, allow_spot_buy=allow_spot_buy, balancing_market=True, verbose=True, load_data=True)
     
-    agent = BiddingCurveAgent(env=env, solver=solver, documentation=True,
+    env_config = {"allow_spot_buy": allow_spot_buy, "balancing_market": True, "verbose": True, "load_data": True, "inflexible": False}
+    env = get_env(RFPRecourseEnv, env_config=env_config, layout_file="rfp_layout - resized.xlsx")
+    
+    agent = BiddingCurveAgent(env=env, solver=solver, documentation=False,
                             guideline=guideline, planning_horizon=planning_horizon, n_scenarios=n_scenarios,
                             mode="eval", no_train=True,
                             )
