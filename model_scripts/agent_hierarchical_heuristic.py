@@ -1319,12 +1319,12 @@ class AggregateFullHorizonAgent(HierarchicalAgent):
         else:
             n_sims = self.n_sims
             year_simulations = self.env.forecaster.simulate_year_ahead(start = time, n_sims=n_sims) # Creates a list of n_sims simulated year-ahead forecasts (pd.DataFrame with hourly index and 'price', 'wind', 'solar' columns)
-
+        ts = pd.date_range(start=time, periods=len(year_simulations[0]), freq='h', tz='UTC')
         # self.longterm_horizon = max(((self.env.episode_end - time).days + 1) * 24 - self.planning_horizon, 0)
-        ts = pd.to_datetime(year_simulations[0].index)
-        current_year = ts[self.planning_horizon].year
+        # ts = pd.to_datetime(year_simulations[0].index)
+        current_year = ts[min(self.planning_horizon,len(ts)-1)].year
 
-        longterm_horizon = max(len(ts[ts.year<=current_year]) - self.planning_horizon, 0)
+        longterm_horizon = max(sum(ts.year<=current_year) - self.planning_horizon, 0)
         average_price_projection = 0
         average_cf_projection = {key: 0 for key in self.env.ppa_names}
         

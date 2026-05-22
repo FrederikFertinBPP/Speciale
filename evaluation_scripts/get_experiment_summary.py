@@ -55,10 +55,17 @@ def get_hindsight_solution(trajectory, stats, rfp, model_class=HourlyDeterminist
                         inflexible=inflexible,
                         )
     pfm.initialize_model()
-    wind_cf = {('WindPower', t): wind_profile[t] for t in range(horizon)}
-    solar_cf = {('SolarPower', t): solar_profile[t] for t in range(horizon)}
-    nuclear_cf = {('NuclearPower', t): 1.0 for t in range(horizon)}
-    supplier_cf = {**wind_cf, **solar_cf, **nuclear_cf,}
+
+    supplier_cf = {}
+    for ix, (name, ppa) in enumerate(rfp.get_ppas().items()):
+        if ppa.parameters.get("consumes") == 'wind':
+            cf = {(name, t): wind_profile[t] for t in range(horizon)}
+        elif ppa.parameters.get("consumes") == 'solar':
+            cf = {(name, t): solar_profile[t] for t in range(horizon)}
+        else:
+            cf = {(name, t): 1.0 for t in range(horizon)} # Assumes full availability of non-variable PPAs.
+        supplier_cf = {**supplier_cf, **cf}
+    
     electricity_price = {t: electricity_price[t] for t in range(horizon)}
     datetime_data = {t: time_index[t] for t in range(horizon)}
     data = {
@@ -312,6 +319,7 @@ if __name__ == '__main__':
                    "backcasting_AggregateFullHorizonAgent_ph_96_spot_True_small",
                    "backcasting_prophet_DeterministicHA_production_value_ph_96_spot_True_small",
                    "backcasting_persistence_DeterministicHA_production_value_ph_96_spot_True_small",)
+    experiments = ("test_contract_DeterministicHA_production_value_ph_96_spot_True_small",)
     # experiments = ("test_StrikePriceBiddingAgent1_SP1_production_value_ph_96_spot_True_small",)
     #### We assess the regret of the model:
     # This is the difference in profits between the actions chosen by the agent and the optimal actions

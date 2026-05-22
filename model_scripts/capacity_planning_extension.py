@@ -44,16 +44,20 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
     def __init__(self,
                 rfp,
                 inflexible: bool = False,
+                enforce_rfnbo: bool = False,
                 planning_horizon: int = 4 * 24,
                 decision_horizon: int = 24,
                 solver: str = 'scip',
+                compute_duals: bool = False,
                 allow_spot_buy: bool = True,
                 documentation: bool = False,
                 capacity_planning: bool = False,   # ← NEW
                 discount_rate: float = 0.1,        # ← NEW (for objective)
+                cvar_info: dict|None = None,
                 **kwargs):
-        super().__init__(rfp=rfp, inflexible=False, planning_horizon=planning_horizon,
-                         decision_horizon=decision_horizon, solver=solver,
+        super().__init__(rfp=rfp, inflexible=False, enforce_rfnbo=enforce_rfnbo,
+                         planning_horizon=planning_horizon, decision_horizon=decision_horizon,
+                         solver=solver, compute_duals=compute_duals,
                          allow_spot_buy=allow_spot_buy, guideline=None,
                          objective_logic=None, documentation=documentation,
                          **kwargs)
@@ -64,6 +68,10 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
             self.min_load_active = False
         self.capacity_planning = capacity_planning   # ← NEW: store flag
         self.discount_rate = discount_rate           # ← NEW: store discount rate for objective
+        self.cvar_formulation = True if cvar_info is not None else False
+        if self.cvar_formulation:
+            self.cvar_alpha = cvar_info.get("alpha", 0.9)
+            self.cvar_beta = cvar_info.get("beta", 0.5)
 
     def _build_abstract_model(self):
         # Model Time Sets:
@@ -81,11 +89,15 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
 
         # Mutable model parameters:
         self.model.T_datetime   = pyo.Param(self.model.T, within=pyo.Any, initialize=pd.date_range(start=0, end=self.planning_horizon - 1, freq='h'), mutable=True)
-        self.model.init_soc           = pyo.Param(self.model.storages, within=pyo.NonNegativeReals, default=0, mutable=True)
-        self.model.supplier_cf        = pyo.Param(self.model.ppas, self.model.T, within=pyo.NonNegativeReals, default=1, mutable=True)
-        self.model.init_contract_status         = pyo.Param(self.model.contracts, within=pyo.NonNegativeReals, default=0, mutable=True)
-        self.model.electricity_price            = pyo.Param(self.model.T, within=pyo.Reals, default=50, mutable=True)
-        self.model.prev_link_setpoints          = pyo.Param(self.model.links, within=pyo.NonNegativeReals, default=0.5, mutable=True)
+
+        self.model.init_contract_status = pyo.Param(self.model.contracts, within=pyo.NonNegativeReals, default=0, mutable=True)
+        self.model.init_soc             = pyo.Param(self.model.storages, within=pyo.NonNegativeReals, default=0, mutable=True)
+        self.model.prev_link_setpoints  = pyo.Param(self.model.links, within=pyo.NonNegativeReals, default=0.5, mutable=True)
+
+        self.model.supplier_cf              = pyo.Param(self.model.ppas, self.model.T, within=pyo.NonNegativeReals, default=1, mutable=True)
+        self.model.electricity_price        = pyo.Param(self.model.T, within=pyo.Reals, default=50, mutable=True)
+        self.model.grid_emissions_intensity = pyo.Param(self.model.T, within=pyo.NonNegativeReals, default=0, mutable=True)
+        self.model.ets_price                = pyo.Param(self.model.T, within=pyo.Reals, default=0, mutable=True)
         
         # If extra spot deal shipment is needed:
         self.model.spot_shipment = pyo.Param(within=pyo.Binary, default=0, mutable=True)
@@ -105,6 +117,7 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
             b.ec         = storage.parameters.get("electricity_consumption", 0)
             b.carrier_in  = str(storage.parameters["consumes"])
             b.carrier_out = str(storage.parameters["produces"])
+            b.rates         = {"in": storage.parameters.get("rate", 1), "out": storage.parameters.get("out_rate", 1)}
 
             if self.capacity_planning:
                 max_cap  = storage.parameters.get("max_capacity", np.inf)
@@ -155,11 +168,18 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
                 # out_flow in (-capacity, capacity*allow_spot_buy); use (-max_cap, max_cap) statically
                 b.out_flow = pyo.Var(self.model.T, domain=pyo.Reals,
                                     bounds=(-max_cap, max_cap * self.allow_spot_buy))
+                b.bought_power = pyo.Var(self.model.T, domain=pyo.NonNegativeReals,
+                                    bounds=(0, max_cap * self.allow_spot_buy))
                 # Linking constraints added in _build_concrete_instance (see Section 6)
             else:
                 b.capacity = dayahead.parameters.get('capacity')
                 b.out_flow = pyo.Var(self.model.T, domain=pyo.Reals,
                                     bounds=(-b.capacity, b.capacity * self.allow_spot_buy))
+                b.bought_power = pyo.Var(self.model.T, domain=pyo.NonNegativeReals,
+                                    bounds=(0, b.capacity * self.allow_spot_buy))
+            def bought_power_rule(m, t):
+                return b.bought_power[t] >= b.out_flow[t]
+            b.bought_power_constraint = pyo.Constraint(self.model.T, rule=bought_power_rule)
         self.model.dayaheadBlocks = pyo.Block(self.model.dayaheads, rule=dayaheadBlock_rule)
 
         def linkBlock_rule(b, lin):
@@ -175,6 +195,7 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
             # Fractional ramp limits (stored as fractions of in_capacity; applied as constraints later)
             b._max_ramp_up_frac   = link.parameters.get('max_ramp_up',   1)
             b._max_ramp_down_frac = link.parameters.get('max_ramp_down', 1)
+            b.reversible    = bool(link.parameters.get('reversible', False))
 
             if self.capacity_planning:
                 max_cap    = link.parameters.get("max_capacity", np.inf)
@@ -183,6 +204,11 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
                 # Static upper bound = max_cap / rate; lower bound = 0 (min_load linked constraint added later)
                 b.in_flow  = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, max_in_cap))
                 b.out_flow = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, max_cap))
+                if b.reversible:
+                    b.reverse_in_flow  = pyo.Var(self.model.T, domain=pyo.NonNegativeReals,
+                                                 bounds=(0, max_cap))
+                    b.reverse_out_flow = pyo.Var(self.model.T, domain=pyo.NonNegativeReals,
+                                                 bounds=(0, max_in_cap))
                 if b.ec > 0:
                     b.elec_cons = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, max_cap * b.ec))
                     b.ec_constraint = pyo.Constraint(
@@ -201,6 +227,11 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
                                     bounds=(b.min_load * b.in_capacity, b.in_capacity))
                 b.out_flow = pyo.Var(self.model.T, domain=pyo.NonNegativeReals,
                                     bounds=(b.min_load * b.capacity, b.capacity))
+                if b.reversible:
+                    b.reverse_in_flow  = pyo.Var(self.model.T, domain=pyo.NonNegativeReals,
+                                                 bounds=(b.min_load*b.capacity, b.capacity))
+                    b.reverse_out_flow = pyo.Var(self.model.T, domain=pyo.NonNegativeReals,
+                                                 bounds=(b.min_load*b.in_capacity, b.in_capacity))
                 if b.ec > 0:
                     b.elec_cons = pyo.Var(self.model.T, domain=pyo.NonNegativeReals,
                                         bounds=(0, b.capacity * b.ec))
@@ -208,6 +239,10 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
                         self.model.T, rule=lambda m, t: b.elec_cons[t] == b.ec * b.out_flow[t])
             b.conversion_constraint = pyo.Constraint(
                 self.model.T, rule=lambda m, t: b.out_flow[t] == b.rate * b.in_flow[t])
+            if b.reversible:
+                def reverse_conversion_rule(m, t):
+                    return b.reverse_in_flow[t] == b.rate * b.reverse_out_flow[t]
+                b.reverse_conversion_constraint = pyo.Constraint(self.model.T, rule=reverse_conversion_rule)
         self.model.linkBlocks = pyo.Block(self.model.links, rule=linkBlock_rule)
 
         def offtakerBlock_rule(b, offt):
@@ -264,7 +299,7 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
                 b.min_volume    = contract.parameters.get("min_volume", b.volume)
                 b.max_volume    = contract.parameters.get("max_volume", b.volume)
                 b.volume_constraint = pyo.Constraint(expr= b.volume == contract.parameters.get("volume"))
-                """ Physical flow of product to contract: """ 
+                """ Physical flow of product to contract: """
                 b.shipment = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.offtaker_capacity))
                 b.shipment_volume_constraint = pyo.Constraint(self.model.T, rule=lambda m, t: b.shipment[t] <= b.volume)
                 if b.is_spot_contract == False:
@@ -278,17 +313,37 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
         self.model.contractBlocks = pyo.Block(self.model.contracts, rule=contractBlock_rule)
 
     def _build_concrete_instance(self, data=None):
-        super()._build_concrete_instance(data)
+        self.inst = self.model.create_instance(data=data)
+        if self.cvar_formulation:
+            self.inst.datetimes = pd.to_datetime([pyo.value(self.inst.T_datetime[t]) for t in self.inst.T])
+            self.inst.years = self.inst.datetimes.year.unique().values
+            self.inst.n_years = len(self.inst.datetimes.year.unique())
+            self.inst.VaR   = pyo.Var(domain=pyo.Reals)
+            self.inst.theta = pyo.Var(self.inst.years, domain=pyo.NonNegativeReals)
+            self.inst.cvar_constraints = pyo.ConstraintList()
+            for year in self.inst.years:
+                T_set = [n for n, is_included in enumerate(self.inst.datetimes.year == year) if is_included]
+                scenario_operational_earnings = self._cashflow_rule(self.inst, T=T_set)
+                self.inst.cvar_constraints.add(self.inst.theta[year] >= self.inst.VaR - scenario_operational_earnings) # CVaR constraint
+
+        super()._build_concrete_instance(data, already_instantiated=True)
         if self.capacity_planning:
             self._add_capacity_linking_constraints()
-        def _ensure_zero_storage_rule(inst, stor, t):
+
+        # emissions = sum(self.inst.grid_emissions_intensity[t] * self.inst.dayaheadBlocks[da].bought_power[t] for da in self.inst.dayaheads for t in self.inst.T)
+        # consumed_power = sum(self.inst.linkBlocks["Grid Connection Point"].in_flow[t] for t in self.inst.T)
+        # emissions_intensity = emissions / consumed_power # tCO2/MWh -> gCO2/MJ
+        # self.inst.emissions_intensity_constraint = pyo.Constraint()
+        if hasattr(self.inst, 'soc_constraint'):
+            self.inst.del_component('soc_constraint')
+        def soc_rule(inst, stor, t): # Define intertemporal SOC logic
             b = inst.storageBlocks[stor]
-            infos = self._get_datetime_infos(inst, t-1)
-            if infos[2] == 1: # If it is the first time step of the year 
-                return b.soc[t] == inst.init_soc[stor] + b.in_flow[t] - b.out_flow[t]
+            was_end_of_year = np.asarray(self._get_datetime_infos(inst, t - 1)).all() # If the last time step was the end of a year, reset.
+            if t == 0 or was_end_of_year: # The initial SOC is externally given.
+                return b.soc[t] == inst.init_soc[stor] + b.in_flow[t] * b.rates["in"] - b.out_flow[t] / b.rates["out"]
             else:
-                return pyo.Constraint.Skip
-        self.inst.init_soc_con = pyo.Constraint(self.inst.storages, self.inst.T, rule=_ensure_zero_storage_rule)
+                return b.soc[t] == b.soc[t-1] + b.in_flow[t] * b.rates["in"] - b.out_flow[t] / b.rates["out"]
+        self.inst.soc_constraint = pyo.Constraint(self.inst.storages, self.inst.T, rule=soc_rule)
 
     def _add_capacity_linking_constraints(self):
         """
@@ -334,6 +389,20 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
             return b.in_flow[t] <= b.capacity / b.rate
         inst.link_out_cap_con = pyo.Constraint(inst.links, inst.T, rule=link_out_cap)
         inst.link_in_cap_con  = pyo.Constraint(inst.links, inst.T, rule=link_in_cap)
+        def link_reverse_out_cap(inst, link, t):
+            b = inst.linkBlocks[link]
+            if b.reversible:
+                return b.reverse_out_flow[t] <= b.capacity / b.rate
+            else:
+                return pyo.Constraint.Skip
+        def link_reverse_in_cap(inst, link, t):
+            b = inst.linkBlocks[link]
+            if b.reversible:
+                return b.reverse_in_flow[t] <= b.capacity
+            else:
+                return pyo.Constraint.Skip
+        inst.link_reverse_out_cap_con = pyo.Constraint(inst.links, inst.T, rule=link_reverse_out_cap)
+        inst.link_reverse_in_cap_con  = pyo.Constraint(inst.links, inst.T, rule=link_reverse_in_cap)
 
         # Min-load lower bound (replaces lower bound on in_flow / out_flow)
         def link_min_in(inst, link, t):
@@ -355,42 +424,55 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
             return b.in_flow[t] <= b.capacity
         inst.offt_in_cap_con = pyo.Constraint(inst.offtakers, inst.T, rule=offt_in_cap)
 
-    def _cashflow_rule(self, inst):
+    def _cvar_cashflow_rule(self, inst):
+        exp_obj = (1-self.cvar_beta) * self._cashflow_rule(inst)        
+        cvar_obj = self.cvar_beta * (inst.VaR - 
+                                     1/(1-self.cvar_alpha) * sum(inst.theta[year] for year in inst.years) / inst.n_years
+                                     )
+        return exp_obj + cvar_obj
+
+    def _cashflow_rule(self, inst, T=None):
+        T = T if T is not None else inst.T
         """ Revenues of the RFP (contract payments happen when shipments happen) """
-        revenue = sum(b.shipment[t] * b.price for name, b in inst.contractBlocks.items() for t in inst.T)
+        revenue = sum(b.shipment[t] * b.price for name, b in inst.contractBlocks.items() for t in T)
 
         """ Costs of the RFP (PPA costs not included as they are exogenously fixed) """
-        costs = self._get_electricity_objective_cost(inst)
+        costs = self._get_electricity_objective_cost(inst, T)
         if self.capacity_planning:
-            costs += self._get_ppa_cost(inst)
+            costs += self._get_ppa_cost(inst, T)
 
         for cont in inst.contracts: # Penalties of not meeting contract obligations:
             b = inst.contractBlocks[cont]
             if b.is_spot_contract == False:
-                costs += sum(b.contract_shortfall[t] * b.penalty for t in inst.T)
+                costs += sum(b.contract_shortfall[t] * b.penalty for t in T)
         
         """ Maximize profits """
-        return revenue - costs
+        annual_earnings = (revenue - costs) / (len(T) / (365.25 * 24))  # Scale to objective time horizon (e.g. 1 year)
+        return annual_earnings
 
     def _set_objective(self):
         def objective_rule(inst):
-            obj = self._cashflow_rule(inst) / (self.planning_horizon / (365 * 24))  # Scale to objective time horizon (e.g. 1 year)
+            if self.cvar_formulation:
+                obj = self._cvar_cashflow_rule(inst)
+            else:
+                obj = self._cashflow_rule(inst)
             obj -= self._capex_cost(inst)          # ← NEW: subtract annualised CAPEX
             return obj
 
         self.inst.objective = pyo.Objective(rule=objective_rule, sense=pyo.maximize)
 
-    def _get_ppa_cost(self, inst):
+    def _get_ppa_cost(self, inst, T=None):
         """
         Cost of electricity procured from PPAs.
         In the operational model this was a fixed cost (exogenous) and excluded
         from the objective. In capacity planning mode the capacity is a decision
         variable, so the cost becomes variable and must be included.
         """
+        T = T if T is not None else inst.T
         return sum(
             inst.ppaBlocks[ppa].out_flow[t] * inst.ppaBlocks[ppa].price
             for ppa in inst.ppas
-            for t in inst.T
+            for t in T
         )
 
     def _capex_cost(self, inst):
@@ -420,3 +502,54 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
             annualized_capex = crf(lifetime) * cc
             cost += (annualized_capex + fom) * b.capacity
         return cost
+
+    def save_optimal_capacities(self, filename):
+        """
+        Save optimal capacities to a CSV file for later use in operational model.
+        """
+        if not self.capacity_planning:
+            raise ValueError("Model was not run in capacity planning mode.")
+        inst = self.inst
+        data = []
+        for stor in inst.storages:
+            b = inst.storageBlocks[stor]
+            data.append({'component': stor, 'type': 'storage', 'optimal_capacity': pyo.value(b.capacity)})
+        for da in inst.dayaheads:
+            b = inst.dayaheadBlocks[da]
+            data.append({'component': da, 'type': 'dayahead', 'optimal_capacity': pyo.value(b.capacity)})
+        for link in inst.links:
+            b = inst.linkBlocks[link]
+            data.append({'component': link, 'type': 'link', 'optimal_capacity': pyo.value(b.capacity)})
+        for offt in inst.offtakers:
+            b = inst.offtakerBlocks[offt]
+            data.append({'component': offt, 'type': 'offtaker', 'optimal_capacity': pyo.value(b.capacity)})
+        for ppa in inst.ppas:
+            b = inst.ppaBlocks[ppa]
+            data.append({'component': ppa, 'type': 'ppa', 'optimal_capacity': pyo.value(b.capacity)})
+        df = pd.DataFrame(data)
+        df.to_csv(filename, index=False)
+
+    def save_capacity_utilization_factors(self, filename):
+        actions = self.get_actions()
+        average_ammonia_production = actions["ammonia_production"].mean()
+        cf_nh3 = average_ammonia_production / self.inst.linkBlocks["Haber Bosch Plant"].capacity.value
+        print("Haber Bosch capacity utilization factor: ", cf_nh3)
+        average_hydrogen_production = actions["hydrogen_production"].mean()
+        cf_h2 = average_hydrogen_production / self.inst.linkBlocks["Electrolyzer"].capacity.value
+        print("Electrolyzer capacity utilization factor: ", cf_h2)
+        power_flow = [pyo.value(self.inst.linkBlocks['Grid Connection Point'].out_flow[t]) for t in self.inst.T]
+        # power_outflow = [pyo.value(self.inst.linkBlocks['Grid Connection Point'].reverse_in_flow[t]) for t in self.inst.T]
+        # power_flow = np.asarray(power_inflow) + np.asarray(power_outflow)
+        average_power_flow = np.mean(power_flow)
+        cf_gcp = average_power_flow / self.inst.linkBlocks['Grid Connection Point'].capacity.value
+        print("Transformer capacity utilization factor: ", cf_gcp)
+        # power_inflow = [pyo.value(self.inst.linkBlocks['Battery Inverter'].out_flow[t]) for t in self.inst.T]
+        # power_outflow = [pyo.value(self.inst.linkBlocks['Battery Inverter'].reverse_in_flow[t]) for t in self.inst.T]
+        # power_flow = np.asarray(power_inflow) + np.asarray(power_outflow)
+        # average_power_flow = np.mean(power_flow)
+        # if self.inst.linkBlocks['Battery Inverter'].capacity.value > 0:
+        #     cf_bess = average_power_flow / self.inst.linkBlocks['Battery Inverter'].capacity.value
+        # else:
+        cf_bess = -1
+        print("Battery Inverter capacity utilization factor: ", cf_bess)
+        pd.DataFrame(index=[0], data={"Haber Bosch":cf_nh3, "Electrolyzer": cf_h2, "GCP": cf_gcp, "BESS": cf_bess}).to_csv(filename)

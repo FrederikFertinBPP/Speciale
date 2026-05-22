@@ -32,9 +32,11 @@ class HourlyDeterministicLPModel:
     def __init__(self,
                  rfp: RenewableFuelPlant,
                  inflexible: bool = False,
+                 enforce_rfnbo: bool = False,
                  planning_horizon: int = 4*24,
                  decision_horizon: int = 24,
                  solver: str = 'scip',
+                 compute_duals: bool = False,
                  allow_spot_buy: bool = True,
                  guideline: str|None = None,
                  objective_logic: str|None = None,
@@ -45,6 +47,7 @@ class HourlyDeterministicLPModel:
         # Problem specific parameters:
         self.rfp              = rfp
         self.inflexible       = inflexible
+        self.enforce_rfnbo    = enforce_rfnbo
         self.decision_horizon = decision_horizon
         self.planning_horizon = max(planning_horizon, self.decision_horizon)
         self.allow_spot_buy   = allow_spot_buy
@@ -72,6 +75,7 @@ class HourlyDeterministicLPModel:
         else:
             self.solver        = SolverFactory(solver)
         self.uses_persistent_solver = issubclass(self.solver.__class__, PersistentSolver)
+        self.compute_duals = compute_duals
 
     def initialize_model(self):
         # Initialize the optimization model
@@ -98,11 +102,15 @@ class HourlyDeterministicLPModel:
         # Mutable model parameters:
         self.model.T_datetime   = pyo.Param(self.model.T, within=pyo.Any, initialize=pd.date_range(start=0, end=self.planning_horizon - 1, freq='h'), mutable=True)
         self.model.timedelta    = pyo.Param(self.model.T, within=pyo.NonNegativeReals, default=1, mutable=True) # Time step duration in hours. Used for scaling of flows.
-        self.model.init_soc           = pyo.Param(self.model.storages, within=pyo.NonNegativeReals, default=0, mutable=True)
-        self.model.supplier_cf        = pyo.Param(self.model.ppas, self.model.T, within=pyo.NonNegativeReals, default=1, mutable=True)
-        self.model.init_contract_status         = pyo.Param(self.model.contracts, within=pyo.NonNegativeReals, default=0, mutable=True)
-        self.model.electricity_price            = pyo.Param(self.model.T, within=pyo.Reals, default=50, mutable=True)
-        self.model.prev_link_setpoints          = pyo.Param(self.model.links, within=pyo.NonNegativeReals, default=0.5, mutable=True)
+        
+        self.model.init_contract_status = pyo.Param(self.model.contracts, within=pyo.NonNegativeReals, default=0, mutable=True)
+        self.model.init_soc             = pyo.Param(self.model.storages, within=pyo.NonNegativeReals, default=0, mutable=True)
+        self.model.prev_link_setpoints  = pyo.Param(self.model.links, within=pyo.NonNegativeReals, default=0.5, mutable=True)
+
+        self.model.supplier_cf              = pyo.Param(self.model.ppas, self.model.T, within=pyo.NonNegativeReals, default=1, mutable=True)
+        self.model.electricity_price        = pyo.Param(self.model.T, within=pyo.Reals, default=50, mutable=True)
+        self.model.grid_emissions_intensity = pyo.Param(self.model.T, within=pyo.NonNegativeReals, default=0, mutable=True)
+        self.model.ets_price                = pyo.Param(self.model.T, within=pyo.Reals, default=0, mutable=True)
         
         # If extra spot deal shipment is needed:
         self.model.spot_shipment = pyo.Param(within=pyo.Binary, default=0, mutable=True)
@@ -138,6 +146,7 @@ class HourlyDeterministicLPModel:
             b.ec            = storage.parameters.get("electricity_consumption", 0) # Electricity consumption rate
             b.carrier_in    = str(storage.parameters["consumes"])
             b.carrier_out   = str(storage.parameters["produces"])
+            b.rates         = {"in": storage.parameters.get("rate", 1), "out": storage.parameters.get("out_rate", 1)}
 
             b.soc       = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.capacity))
             b.in_flow   = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(0, b.capacity))
@@ -189,6 +198,13 @@ class HourlyDeterministicLPModel:
             def conversion_rule(m, t):
                 return b.out_flow[t] == b.rate * b.in_flow[t]
             b.conversion_constraint = pyo.Constraint(self.model.T, rule=conversion_rule)
+            b.reversible    = bool(link.parameters.get('reversible', False))
+            if b.reversible:
+                b.reverse_in_flow  = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(b.min_load*b.capacity, b.capacity))
+                b.reverse_out_flow = pyo.Var(self.model.T, domain=pyo.NonNegativeReals, bounds=(b.min_load*b.in_capacity, b.in_capacity))
+                def reverse_conversion_rule(m, t):
+                    return b.reverse_in_flow[t] == b.rate * b.reverse_out_flow[t]
+                b.reverse_conversion_constraint = pyo.Constraint(self.model.T, rule=reverse_conversion_rule)
             if self.inflexible and bool(link.parameters.get('efficiency_curve', 0)):
                 ec_rule = lambda m, t, segment: pyo.Constraint.Skip
                 b.max_electricity_consumption = None
@@ -316,8 +332,9 @@ class HourlyDeterministicLPModel:
                     (b.shipment_frequency == 'monthly' and is_month_end and is_day_end) or  # If we have a monthly shipment and it is end-of-month and EOD.
                     (b.shipment_frequency == 'yearly'  and is_year_end and is_day_end))     # If we have a yearly shipment and it is end-of-year and EOD.
 
-    def _build_concrete_instance(self, data=None):
-        self.inst = self.model.create_instance(data=data)
+    def _build_concrete_instance(self, data=None, already_instantiated=False):
+        if not already_instantiated:
+            self.inst = self.model.create_instance(data=data)
         self.updated_constraints = []
 
         """ If we are guiding the model with planning targets for contracts, this logic should be added to the contractBlocks """
@@ -326,6 +343,17 @@ class HourlyDeterministicLPModel:
                 return inst.linkBlocks["Haber Bosch Plant"].out_flow[t] == inst.hourly_target
             self.inst.hourly_target_constraint = pyo.Constraint(self.inst.T, rule=hourly_target_rule)
             self.updated_constraints += ['hourly_target_constraint']
+        
+        if self.enforce_rfnbo:
+            def rfnbo_hourly_rule(inst, da, t):
+                b = inst.dayaheadBlocks[da]
+                ets_price = pyo.value(self.inst.ets_price[t])
+                el_price = pyo.value(self.inst.electricity_price[t])
+                if el_price > max(20, 0.36 * ets_price):
+                    return b.out_flow[t] <= 0
+                else:
+                    return pyo.Constraint.Skip
+            self.inst.rfnbo_hourly_constraint = pyo.Constraint(self.inst.dayaheads, self.inst.T, rule=rfnbo_hourly_rule)
 
         """ Rules that define the physical reality of the renewable fuel plant. """
         def carrier_balance_rule(inst, carr, t): # Ensure balance equations of plant energy carriers.
@@ -333,7 +361,10 @@ class HourlyDeterministicLPModel:
             for name, comp in self.rfp.get_components().items():
                 if comp.parameters.get("produces") == b.type:
                     if comp.is_link:
-                        b._in[t].append(inst.linkBlocks[name].out_flow[t])
+                        ll = inst.linkBlocks[name]
+                        b._in[t].append(ll.out_flow[t])
+                        if ll.reversible:
+                            b._in[t].append(-ll.reverse_out_flow[t])
                     elif comp.is_storage:
                         b._in[t].append(inst.storageBlocks[name].out_flow[t])
                     elif comp.is_ppa:
@@ -342,7 +373,10 @@ class HourlyDeterministicLPModel:
                         b._in[t].append(inst.dayaheadBlocks[name].out_flow[t])
                 if comp.parameters.get("consumes") == b.type:
                     if comp.is_link:
-                        b._out[t].append(inst.linkBlocks[name].in_flow[t])
+                        ll = inst.linkBlocks[name]
+                        b._out[t].append(ll.in_flow[t])
+                        if ll.reversible:
+                            b._out[t].append(-ll.reverse_in_flow[t])
                     elif comp.is_storage:
                         b._out[t].append(inst.storageBlocks[name].in_flow[t])
                     elif comp.is_offtaker:
@@ -366,9 +400,9 @@ class HourlyDeterministicLPModel:
         def soc_rule(inst, stor, t): # Define intertemporal SOC logic
             b = inst.storageBlocks[stor]
             if t == 0: # The initial SOC is externally given.
-                return b.soc[0] == inst.init_soc[stor] + b.in_flow[0] - b.out_flow[0]
+                return b.soc[t] == inst.init_soc[stor] + b.in_flow[t] * b.rates["in"] - b.out_flow[t] / b.rates["out"]
             else:
-                return b.soc[t] == b.soc[t-1] + b.in_flow[t] - b.out_flow[t]
+                return b.soc[t] == b.soc[t-1] + b.in_flow[t] * b.rates["in"] - b.out_flow[t] / b.rates["out"]
         self.inst.soc_constraint = pyo.Constraint(self.inst.storages, self.inst.T, rule=soc_rule)
 
         def offtake_rule(inst, offt, t): # Ensure that offtake is matched to sale flows and that offtake stream does not violate capacity.
@@ -430,7 +464,7 @@ class HourlyDeterministicLPModel:
 
         self._set_objective()
 
-        self.inst.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+        if self.compute_duals: self.inst.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
         self.updated_constraints += ["ppa_procurement_constraint", "soc_constraint", "status_constraint", "shipment_constraint", "shortfall_constraint"]
 
     def _update_instance(self, data=None):
@@ -462,10 +496,11 @@ class HourlyDeterministicLPModel:
         else:
             self._build_concrete_instance(data)
 
-    def _get_electricity_objective_cost(self, inst):
+    def _get_electricity_objective_cost(self, inst, T=None):
         # When out_flow is positive, we are buying electricity; negative, we are selling.
         # We assume now that there is only one price realization of day-ahead markets. Could be generalized if we also want to buy from neighbouring bidding zones.
-        return sum(inst.dayaheadBlocks[dayahead].out_flow[t] * inst.electricity_price[t] for t in inst.T for dayahead in inst.dayaheads)
+        T = T if T is not None else inst.T
+        return sum(inst.dayaheadBlocks[dayahead].out_flow[t] * inst.electricity_price[t] for t in T for dayahead in inst.dayaheads)
 
     def _cashflow_rule(self, inst):
         """ Revenues of the RFP (contract payments happen when shipments happen) """
@@ -1438,6 +1473,10 @@ class StochasticRecourseModel(HourlyRecourseModel):
                     return b.main_shipment[t] == b.shipment[s,t]
                 b.main_shipment_constraint = pyo.Constraint(self.model.S, self.model.T_fix_recourse, rule=main_shipment_rule)
         self.model.contractBlocks = pyo.Block(self.model.contracts, rule=contractBlock_rule)
+
+        self.model.allBlocks = {**self.model.linkBlocks, **self.model.storageBlocks, **self.model.ppaBlocks,
+                                **self.model.dayaheadBlocks, **self.model.carrierBlocks, **self.model.contractBlocks,
+                                **self.model.offtakerBlocks}
     
     def _build_concrete_instance(self, data=None):
         self.inst = self.model.create_instance(data=data)
@@ -1455,6 +1494,8 @@ class StochasticRecourseModel(HourlyRecourseModel):
             b = inst.carrierBlocks[carr]
             for name, comp in self.rfp.get_components().items():
                 if comp.parameters.get("produces") == b.type:
+                    if comp.is_link or comp.is_storage or comp.is_ppa or comp.is_dayahead:
+                        b._in[s,t].append(inst.allBlocks[name].out_flow[s,t])
                     if comp.is_link:
                         b._in[s,t].append(inst.linkBlocks[name].out_flow[s,t])
                     elif comp.is_storage:

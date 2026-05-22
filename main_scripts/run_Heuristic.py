@@ -22,7 +22,7 @@ def main():
     n_episodes = 1
     
     env_config = {"allow_spot_buy": allow_spot_buy, "balancing_market": False, "verbose": True, "load_data": True, "inflexible": True}
-    env = get_env(RFPModelActionsEnv, env_config=env_config, layout_file="rfp_layout - resized.xlsx")
+    env = get_env(RFPModelActionsEnv, env_config=env_config, layout_file="rfp_layout - resized.xlsx", use_optimized_capacities=True)
     
     agent = DeterministicHA(env=env, solver=solver, planning_horizon=planning_horizon, guideline=guideline, documentation=False)
     

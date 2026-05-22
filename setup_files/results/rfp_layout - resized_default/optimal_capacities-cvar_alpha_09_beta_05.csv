@@ -1,0 +1,14 @@
+component,type,optimal_capacity
+Battery Storage,storage,0.0
+Hydrogen Storage,storage,10.340708629505864
+Ammonia Storage,storage,12548.664623609595
+ElectricitySpot,dayahead,976.9
+Grid Connection Point,link,255.73018807386305
+Battery Inverter,link,0.0
+Electrolyzer,link,4.190122629579981
+Haber Bosch Plant,link,19.26160359973932
+Hydrogen Pipeline,offtaker,2.0
+Ammonia Shipment,offtaker,30000.0
+SolarPower,ppa,258.90000000000003
+WindPower,ppa,539.1
+HydroPower,ppa,37.33896906066141

@@ -18,8 +18,11 @@ def get_env(env_class:gym.Env,
             scenario_name:str="default",
             data_cache_id:str="Anders",
             layout_file:str="rfp_layout.xlsx",
+            use_optimized_capacities = False,
             ):
     rfp = create_rfp(scenario_name=scenario_name, layout_file=layout_file)
+    if use_optimized_capacities:
+        rfp.set_capacities_from_file(f"setup_files/optimal_capacities_{layout_file.split('.')[0]}_{scenario_name}.csv")
 
     forecaster = DataForecaster(from_pickle=True, cache_id=data_cache_id)
     forecaster = forecaster.unpickle()

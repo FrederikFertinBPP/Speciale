@@ -73,11 +73,12 @@ class RenewableFuelPlant():
     frequency_rank = dict(zip(frequency_options, range(len(frequency_options))))
     uncertainties = ["wind", "solar", "price"]
 
-    def __init__(self) -> None:
+    def __init__(self, layout_file=None) -> None:
         self.components = {}
         self.contracts = {}
         self.carriers = {}
         self.ppas = {}
+        self.layout_file = layout_file
 
     def add_ppa(self, ppa) -> None:
         """
@@ -258,6 +259,20 @@ class RenewableFuelPlant():
     def to_dict(self) -> dict:
         """ Returns the RFP information as a dict. """
         return self.__dict__
+    
+    def set_capacities_from_file(self, capacity_file:str) -> None:
+        """
+        Set the capacities of the components in the RFP based on a given file.
+        Args:
+            capacity_file (str): The path to the file containing the optimal capacities.
+        """
+        df = pd.read_csv(capacity_file)
+        for _, row in df.iterrows():
+            component_name = row["component"]
+            capacity = row["optimal_capacity"]
+            component = self.get_component(component_name)
+            if component is not None:
+                component.parameters["capacity"] = capacity
 
 def load_input_data(layout_file:str = "rfp_layout.xlsx"):
     xls_path = os.path.abspath('./setup_files/' + layout_file)
@@ -268,11 +283,11 @@ def load_input_data(layout_file:str = "rfp_layout.xlsx"):
     scenario_info = pd.read_excel(xls_path, sheet_name="Scenarios")
     return df_components, df_contracts, df_carriers, df_ppas, scenario_info
 
-def create_rfp(scenario_name:str = "default", layout_file:str = "rfp_layout.xlsx") -> RenewableFuelPlant:
+def create_rfp(scenario_name:str = "", layout_file:str = "rfp_layout.xlsx") -> RenewableFuelPlant:
     """
     Create a renewable fuel plant with defined components (i.e. fixed capacities and such) and contracts.
     """
-    rfp = RenewableFuelPlant()
+    rfp = RenewableFuelPlant(layout_file=layout_file)
     df_components, df_contracts, df_carriers, df_ppas, scenario_info = load_input_data(layout_file=layout_file)
     
     for _, row in df_carriers.iterrows():

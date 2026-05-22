@@ -11,7 +11,7 @@ from model_scripts.environment import RFPModelActionsEnv, get_env
 from model_scripts.agent_hierarchical_heuristic import AggregateFullHorizonAgent
 
 def main():
-    rfp_case = "small"
+    rfp_case = "optimized_capacities"
     planning_horizon = 96
     allow_spot_buy = True
     solver = 'gurobi'
@@ -19,7 +19,7 @@ def main():
     n_episodes = 1
     
     env_config = {"allow_spot_buy": allow_spot_buy, "balancing_market": False, "verbose": True, "load_data": True, "inflexible": True}
-    env = get_env(RFPModelActionsEnv, env_config=env_config, layout_file="rfp_layout - resized.xlsx")
+    env = get_env(RFPModelActionsEnv, env_config=env_config, layout_file="rfp_layout - resized.xlsx", use_optimized_capacities=True)
     
     agent = AggregateFullHorizonAgent(env=env, solver=solver, planning_horizon=planning_horizon, documentation=False)
     

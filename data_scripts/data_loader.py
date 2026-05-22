@@ -11,6 +11,52 @@ import matplotlib.pyplot as plt
 
 # Token for ENTSO-E Transparency Platform: 134329c1-a120-4b33-8fa1-c96e9b46af59
 
+def get_fossil_prices(hourly_index, price_indicator="c"):
+    import pandas as pd
+    path = "historical_data/commodity_prices/"
+    def _concat(df1, df2):
+        df = pd.concat([df1,df2])
+        df.index = pd.to_datetime([pd.Timestamp(t,unit="s") for t in df["t"]],utc=True)
+        df = df.sort_index()
+        df = df.drop_duplicates(subset="t")
+        return df
+    df_gas_monthly = pd.read_json(f"{path}gas_futures_monthly.json")
+    df_gas_weekly = pd.read_json(f"{path}gas_futures_weekly.json")
+    df_gas = _concat(df_gas_monthly, df_gas_weekly)
+
+    df_oil_monthly = pd.read_json(f"{path}oil_brent_monthly.json")
+    df_oil_weekly = pd.read_json(f"{path}oil_brent_weekly.json")
+    df_oil = _concat(df_oil_monthly, df_oil_weekly)
+    
+    df_ets = pd.read_excel(f"{path}prices_eu_ets_all.xlsx",sheet_name="Data")
+    df_ets.index = pd.to_datetime(df_ets["datetime"],utc=True)
+    df_ets = df_ets.sort_index()
+    df_ets = df_ets.drop_duplicates(subset="datetime")
+    
+    def _add_series(df,column,series,key,):
+        df = df.copy()
+        series_lim = series.loc[(series.index >= df.index[0]) & (series.index <= df.index[-1]),key]
+        row_indexer_df = [t in series_lim.index for t in df.index]
+        df.loc[row_indexer_df, column] = series_lim.values
+        df.loc[df.index[0],column] = series.iloc[max(0, sum(series.index <= df.index[0])-1)][key]
+        df.loc[df.index[-1],column] = series.iloc[min(sum(series.index < df.index[-1]), len(series)-1)][key]
+        return df
+
+    # hourly_index = pd.to_datetime(pd.date_range(start="2010-01-01", end="2025-12-31"),utc=True)
+    df = pd.DataFrame(index=hourly_index, columns=["gas","oil","ets"], dtype=float)
+    df = _add_series(df, "gas", df_gas, price_indicator)
+    df = _add_series(df, "oil", df_oil, price_indicator)
+    df = _add_series(df, "ets", df_ets, "price")
+    df = df.interpolate()
+
+    # Get gas price without ETS price, as the model will have ETS price as a separate feature.
+    # This is to avoid the model learning the relation between gas and ETS price, which is not causal and may change in the future.
+    mmbtu_to_gj = 1.055056 # GJ/MMBtu
+    gas_emission_factor = 0.0501 # tCO2/GJ
+    df["gas_with_ets"] = df["gas"] + df["ets"] * gas_emission_factor * mmbtu_to_gj
+
+    return df
+
 class DataLoader:
     time_columns = ['is_weekend', 'is_winter', 'is_summer', 'is_spring', 'is_autumn', 'is_day']
     def __init__(self):
@@ -70,7 +116,6 @@ class DataLoader:
         if drop_columns is not None:
             df = df.drop([drop_columns], axis=1)
         return df
-    
 
 class HistoricalData(DataLoader):
     # Define API endpoint and parameters
@@ -85,11 +130,13 @@ class HistoricalData(DataLoader):
                  country_code:str   = "PT",
                  server:str         = "ENTSOE",
                  load_data:bool     = True,
+                 create_time_features:bool = True,
                  ):
         self.filepath = 'historical_data/clean_dataframes/' +'server-' + server + 'country-' + country_code + "_".join(priceArea) + str(start).split(' ')[0] + 'to' + str(end).split(' ')[0] + '.csv'
         self.country = country_code
         self.start, self.end = start, end
         self.server, self.limit, self.priceArea = server, limit, priceArea
+        self.create_time_features = create_time_features
         if load_data:
             self.load_capacity_data()
             self.get_price_and_generation_data()
@@ -102,6 +149,8 @@ class HistoricalData(DataLoader):
         else:
             if self.server == 'ENTSOE':
                 self.data = self.get_data_from_entsoe()
+                df_fossil = get_fossil_prices(self.data.index)
+                self.data = pd.concat([self.data, df_fossil], axis=1)
             elif self.server == 'EnergiDataService':
                 self.params = {
                     "start": str(self.start).split('+')[0],  # Start date/time in Danish time
@@ -118,9 +167,10 @@ class HistoricalData(DataLoader):
             # self.data = self.data.drop(self.data.loc[self.data.isna().any(axis=1)].index)
             # self.data = self._fill_missing_generation_hours(self.data)
             self.data.to_csv(self.filepath, index=True)
-        self.data = self._create_seasonal_features(df=self.data[['price', 'wind', 'solar']], prod_columns=['wind', 'solar'])
-        self.data['log_wind'] = log_transform(self.data['wind'])
-        self.data['log_solar'] = log_transform(self.data['solar'])
+        if self.create_time_features:
+            self.data = self._create_seasonal_features(df=self.data, prod_columns=['wind', 'solar'])
+            self.data['log_wind'] = log_transform(self.data['wind'])
+            self.data['log_solar'] = log_transform(self.data['solar'])
 
     def load_capacity_data(self, filepath='historical_data/wind_solar_capacity_PT.csv'):
         # Taken from ENTSO-E Transparency Platform (does not match generation data):
@@ -162,13 +212,13 @@ class HistoricalData(DataLoader):
         df_id       = self.client.query_imbalance_prices(country_code="PT",start=self.start,end=self.end+pd.Timedelta(24, 'h'))
         df_id       = df_id.loc[df_id.index.minute==0]
 
-        self.client.query_intraday_prices(country_code=self.country,start=self.end,end=self.end+pd.Timedelta(23, 'h'), sequence=1)
+        # self.client.query_intraday_prices(country_code=self.country,start=self.start,end=self.end+pd.Timedelta(23, 'h'), sequence=1)
         
         # Load Capacity Data
         # df_capacity = self.client.query_installed_generation_capacity()
         # df_capacity = self.client.query_installed_generation_capacity(country_code=self.country,start=self.start,end=self.end+pd.Timedelta(24, 'h'))
         # df_capacity_per_unit = self.client.query_installed_generation_capacity_per_unit(country_code=self.country,start=self.start,end=self.end+pd.Timedelta(24, 'h'))
-        self.client.query_offered_capacity()
+        # self.client.query_offered_capacity()
 
         # Load Load Data
         df_load = self.client.query_load_and_forecast(country_code=self.country,start=self.start,end=self.end+pd.Timedelta(24, 'h'))
@@ -248,7 +298,6 @@ class HistoricalData(DataLoader):
         wind = self._fill_missing_generation_hours(wind) # Fill in hours of missing data
         solar = self._fill_missing_generation_hours(solar)
         return wind, solar
-
 
 def historical_price_inspection(data_object : HistoricalData):
     # Constants
