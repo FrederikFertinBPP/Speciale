@@ -87,7 +87,7 @@ def main():
     scenario_name = "" # Same as default
     layout_file = "article.xlsx"
     cvar_info = {"cvar_alpha":0.9, "cvar_beta":0.5}
-    # cvar_info = None
+    cvar_info = None
 
     #%% Preprocessing
 
@@ -96,10 +96,11 @@ def main():
         cvar_str = str(cvar_info).replace(":","").replace("{","").replace("}","").replace("'","").replace(",","").replace(" ","_").replace(".","").replace("_cvar","")
     else:
         cvar_str = "risk_neutral"
-    results_folder = f"setup_files/results/{rfp.layout_file.split(".")[0]}_{scenario_name}"
+    results_folder = f"setup_files/results/{rfp.layout_file.split(".")[0]}{scenario_name}_updated"
     os.makedirs(results_folder, exist_ok=True)
 
     data, horizon, ppa_prices = get_data(rfp)
+    pd.DataFrame(index=[0],data=ppa_prices).to_csv(f"{results_folder}/ppa_prices-{cvar_str}.csv")
     for name, ppa in rfp.get_ppas().items():
         resource = ppa.parameters.get("consumes")
         if resource in ('wind', 'solar'):
@@ -124,6 +125,7 @@ def main():
     #%% Save main results:
     capacity_planner.save_optimal_capacities(f"{results_folder}/optimal_capacities-{cvar_str}.csv")
     capacity_planner.save_capacity_utilization_factors(f"{results_folder}/cf-{cvar_str}.csv")
+    capacity_planner.save_operational_earnings(f"{results_folder}/operational_earnings-{cvar_str}.csv")
     print("Results saved.")
 
 #%% Timing

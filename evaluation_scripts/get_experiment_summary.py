@@ -79,7 +79,7 @@ def get_hindsight_solution(trajectory, stats, rfp, model_class=HourlyDeterminist
     pfm.run()
     return pfm
 
-def get_realization_summary(trajectory, stats, rfp):
+def get_realization_summary(trajectory, stats, rfp, plot_emissions=False):
     horizon_days = len(trajectory.reward)
     T = range(1, horizon_days+1)
 
@@ -141,7 +141,7 @@ def get_realization_summary(trajectory, stats, rfp):
     grid_emission_factor = []
     for t in T:
         grid_emission_factor += list(trajectory.env_info[t]['electricity_emissions'])
-    grid_emission_factor = np.asarray(grid_emission_factor)
+    grid_emission_factor = np.asarray(grid_emission_factor) * 1000
 
     emissions_summary = {}
     emissions_summary["average"] = np.mean(grid_emission_factor)
@@ -171,7 +171,7 @@ def get_realization_summary(trajectory, stats, rfp):
     ppa_capacity_factor = {key: (np.mean(ppa_profile[key]) / ppa_capacities[key] if ppa_capacities[key] > 0 else 0.0) for key in ppas}
     ppa_capture_prices = {key: (np.sum(ppa_profile[key] * da_prices) / ppa_production[key] if ppa_capacities[key] > 0 else 0.0) for key in ppas}
     capture_price_summary["ppa"] = ppa_capture_prices
-    emissions_summary["totals"]["baseload_ppa"] = emissions_summary["average"] * sum(ppa_production[key] for key in ppas if not(stats['ppas'][key].parameters.get("simulated")))
+    emissions_summary["totals"]["baseload_ppa"] = 0 # emissions_summary["average"] * sum(ppa_production[key] for key in ppas if not(stats['ppas'][key].parameters.get("simulated")))
     emissions_summary["balance"] = emissions_summary["totals"]["buying"] + emissions_summary["totals"]["baseload_ppa"] - emissions_summary["totals"]["selling"]
 
     power_consumption = np.sum([sum(trajectory.env_info[t]['power_consumption']) for t in T])
@@ -199,12 +199,66 @@ def get_realization_summary(trajectory, stats, rfp):
 
     realized_total_revenue = contracted_revenue + spot_summary["revenue"]["total"]
 
+    print("Spot Revenue:", da_prices @ sell_profile, "€")
+    print("Spot Costs:", da_prices @ buy_profile, "€")
+    print("Bought Power:", buy_profile.sum(), "MWh")
+    print("Sold Power:", sell_profile.sum(), "MWh")
+
+    if plot_emissions:
+        hourly_index = pd.to_datetime(pd.date_range(start=pd.Timestamp("20250101 000000"), end=pd.Timestamp("20251231 230000"), freq='h'))
+        hydrogen_production = np.asarray([(trajectory.env_info[t]['link_productions']['Electrolyzer']) for t in T]).reshape(-1) # tH2
+        ammonia_production = np.asarray([(trajectory.env_info[t]['link_productions']['Haber Bosch Plant']) for t in T]).reshape(-1) # tNH3
+        electricity_consumption = np.asarray([(trajectory.env_info[t]['link_productions']['Grid Connection Point']) for t in T]).reshape(-1) # tNH3
+        upstream_emissions = buy_profile*grid_emission_factor #tCO2/MWh * MWh = tCO2
+        abated_emissions = sell_profile*grid_emission_factor #tCO2
+        # fuel_production = (hydrogen_production * 120/3.6 + (18.6/3.6 - (120/3.6)/5.5) * ammonia_production) # t * MWh/t = MWh
+        nh3_rate = rfp.get_component("Haber Bosch Plant").parameters["rate"]
+        hydrogen4ammonia = sum(ammonia_production)/nh3_rate
+        hydrogen4hydrogen1 = sum(hydrogen_production) - hydrogen4ammonia
+        fuel_production = hydrogen_production * (hydrogen4hydrogen1 * 120 + hydrogen4ammonia * 18.6 * nh3_rate) / sum(hydrogen_production) / 3.6
+        # fuel_production = hydrogen_production * 120/3.6 
+        emissions_intensities = upstream_emissions / fuel_production * 10**6 / 3600 # tCO2 / MWh * t/g / (MWh / MJ) = gCO2/MJ
+        emissions_timeseries = pd.DataFrame(index=hourly_index,data={"Production [MWh]":fuel_production, "Emission Intensity [gCO2/MJ]": emissions_intensities})
+        sorted_emissions = emissions_timeseries.sort_values(by="Emission Intensity [gCO2/MJ]")
+        sorted_emissions["Cumulative Production [MWh]"] = sorted_emissions["Production [MWh]"].cumsum()
+
+        intensities = emissions_timeseries.groupby(hourly_index.month).mean()["Emission Intensity [gCO2/MJ]"]
+        productions = emissions_timeseries.groupby(hourly_index.month).sum()["Production [MWh]"]
+        emissions_timeseries_monthly = pd.DataFrame(index=hourly_index.month.unique(),data={"Production [MWh]":productions, "Emission Intensity [gCO2/MJ]": intensities})
+        sorted_emissions_monthly = emissions_timeseries_monthly.sort_values(by="Emission Intensity [gCO2/MJ]")
+        sorted_emissions_monthly["Cumulative Production [MWh]"] = sorted_emissions_monthly["Production [MWh]"].cumsum()
+
+        fig, ax = plt.subplots(figsize=(12,8))
+        plt.plot(sorted_emissions["Cumulative Production [MWh]"],
+                sorted_emissions["Emission Intensity [gCO2/MJ]"],
+                label="Hourly matched emissions intensity",
+                color='green', lw=3)
+        plt.plot([0]+list(sorted_emissions_monthly["Cumulative Production [MWh]"]),
+                [sorted_emissions_monthly["Emission Intensity [gCO2/MJ]"].iloc[0]]+list(sorted_emissions_monthly["Emission Intensity [gCO2/MJ]"]),
+                label="Monthly matched emissions intensity",
+                color='blue', lw=3)
+        plt.axhline(94*0.3,
+                    label="Threshold value for qualifying as RFNBO fuel",
+                    color="red",
+                    linestyle="--", lw=3)
+        plt.axhline(94,
+                    label="Fossil fuel comparator",
+                    color="black", lw=3)
+        plt.xlim(0,max(sorted_emissions["Cumulative Production [MWh]"])*1.005)
+        plt.ylim(-0.5)
+        plt.xlabel("Fuel produced [MWh]")
+        plt.ylabel("Emissions Intensity [gCO2/MJ]")
+        plt.legend(loc="center left")
+        plt.tight_layout()
+        plt.savefig("documentation/emissions_timing.png")
+        plt.close()
+
     return (spot_summary, capture_price_summary, emissions_summary, ppa_capacity_factor, contract_revenues, contract_penalties,
             ppa_cost, el_revenue, contracted_revenue, contract_penalty,
             revenue_exposure, cost_exposure, short_exposure, long_exposure, balancing_exposure,
             emissions_summary["fuel_emissions_intensity"], realized_total_revenue, hydrogen_produced, grid_emission_factor)
 
-def print_trajectory_summary(trajectory, stats, rfp, model_class = HourlyDeterministicLPModel, opt_model=None):
+def print_trajectory_summary(trajectory, stats, rfp, model_class = HourlyDeterministicLPModel, opt_model=None, plot_emissions=False):
     normalized = stats.get("normalized",False)
     print("\n----------------------------------\n")
     print("Total reward: ", np.round(sum(trajectory.reward)*1e-6, 2), " M€")
@@ -212,12 +266,26 @@ def print_trajectory_summary(trajectory, stats, rfp, model_class = HourlyDetermi
     (spot_summary, capture_price_summary, emissions_summary, ppa_capacity_factor, contract_revenues, contract_penalties,
             ppa_cost, el_revenue, contracted_revenue, contract_penalty,
             revenue_exposure, cost_exposure, short_exposure, long_exposure, balancing_exposure,
-            emissions_intensity, realized_total_revenue, hydrogen_produced, grid_emission_factor) = get_realization_summary(trajectory=trajectory, stats=stats, rfp=rfp)
+            emissions_intensity, realized_total_revenue, hydrogen_produced, grid_emission_factor) = get_realization_summary(trajectory=trajectory, stats=stats, rfp=rfp, plot_emissions=plot_emissions)
 
     #%% Electricity revenue summary
     if opt_model is None:
         opt_model = get_hindsight_solution(trajectory=trajectory, stats=stats, rfp=rfp, model_class=model_class)
     opt_el_revenue = opt_model.decision_results.exp_el_revenue
+
+    opt_da_trade = np.asarray([opt_model.inst.componentBlocks["ElectricitySpot"].out_flow[t].value for t in opt_model.inst.T])
+    da_prices = []
+    horizon_days = len(trajectory.reward)
+    T = range(1, horizon_days+1)
+    for t in T:
+        da_prices += list(trajectory.env_info[t]['electricity_price'])
+    da_prices = np.asarray(da_prices)
+    opt_da_buy = (opt_da_trade > 0) * opt_da_trade
+    opt_da_sell = -((opt_da_trade < 0) * opt_da_trade)
+    print("Opt. Spot Revenue:", da_prices @ opt_da_sell, "€")
+    print("Opt. Spot Costs:", da_prices @ opt_da_buy, "€")
+    print("Opt. Bought Power:", opt_da_buy.sum(), "MWh")
+    print("Opt. Sold Power:", opt_da_sell.sum(), "MWh")
 
     opt_emissions = emissions_summary["totals"]["baseload_ppa"] + opt_model.decision_results.da_buy @ grid_emission_factor
     opt_hydrogen_produced = opt_model.decision_results.link_production["Electrolyzer"].sum()

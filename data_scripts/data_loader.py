@@ -1,18 +1,7 @@
 import pandas as pd
-import numpy as np
-import os
-import json
-import requests
-from common_scripts.utils import log_transform, delog_transform
-from entsoe import EntsoePandasClient
-from astral import LocationInfo
-from astral.sun import sun
-import matplotlib.pyplot as plt
 
 # Token for ENTSO-E Transparency Platform: 134329c1-a120-4b33-8fa1-c96e9b46af59
-
 def get_fossil_prices(hourly_index, price_indicator="c"):
-    import pandas as pd
     path = "historical_data/commodity_prices/"
     def _concat(df1, df2):
         df = pd.concat([df1,df2])
@@ -74,6 +63,9 @@ class DataLoader:
         Returns:
         - df: original DataFrame with 'sunrise' and 'sunset' columns added
         """
+        from astral.sun import sun
+        from astral import LocationInfo
+
         location = LocationInfo(city_name, country, timezone, latitude, longitude)
 
         # Create sunrise/sunset columns
@@ -143,6 +135,7 @@ class HistoricalData(DataLoader):
     
     def get_price_and_generation_data(self):
         # Load generation and price data
+        import os
         if os.path.exists(self.filepath):
             self.data = pd.read_csv(self.filepath, index_col=0)
             self.data = self.data.set_index(pd.to_datetime(self.data.index, utc=True))
@@ -152,6 +145,7 @@ class HistoricalData(DataLoader):
                 df_fossil = get_fossil_prices(self.data.index)
                 self.data = pd.concat([self.data, df_fossil], axis=1)
             elif self.server == 'EnergiDataService':
+                import json
                 self.params = {
                     "start": str(self.start).split('+')[0],  # Start date/time in Danish time
                     "end": str(self.end).split('+')[0],    # End date/time (exclusive)
@@ -169,6 +163,7 @@ class HistoricalData(DataLoader):
             self.data.to_csv(self.filepath, index=True)
         if self.create_time_features:
             self.data = self._create_seasonal_features(df=self.data, prod_columns=['wind', 'solar'])
+            from common_scripts.utils import log_transform
             self.data['log_wind'] = log_transform(self.data['wind'])
             self.data['log_solar'] = log_transform(self.data['solar'])
 
@@ -204,6 +199,7 @@ class HistoricalData(DataLoader):
         #                          data={'wind' : w_c.astype(float), 'solar' : s_c.astype(float)})
 
     def get_data_from_entsoe(self):
+        from entsoe import EntsoePandasClient
         self.client = EntsoePandasClient(api_key=self.ENTSOE_TOKEN) # Object to query data through
 
         # Load Price Data
@@ -246,11 +242,13 @@ class HistoricalData(DataLoader):
         df[id_columns] = df_id.copy()
         missing_imbalances = df.isna().max(axis=1)
         da_prices_corresponding = df.loc[missing_imbalances, 'price'].values
+        import numpy as np
         df.loc[missing_imbalances, id_columns] = np.transpose([da_prices_corresponding]*2)
         
         return df
 
     def _get_response(self, url):
+        import requests
         # Make the request
         response = requests.get(url, params=self.params)
         data = response.json()
@@ -300,6 +298,8 @@ class HistoricalData(DataLoader):
         return wind, solar
 
 def historical_price_inspection(data_object : HistoricalData):
+    import numpy as np
+    import matplotlib.pyplot as plt
     # Constants
     h2_price_eur_per_mwh = 3 * 0.7 * (120 / 3.6)  # 3 €/kg example
     data = data_object.data.copy()

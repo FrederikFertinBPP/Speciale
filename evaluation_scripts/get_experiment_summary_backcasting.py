@@ -7,7 +7,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from common_scripts.utils import load_trajectories, load_stats, Trajectory
 from common_scripts.RFP_initialization import create_rfp
-from model_scripts.hourly_models import HourlyDeterministicLPModel
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -25,15 +24,54 @@ def get_yearly_summary(trajectory, stats, rfp, year, opt_model = None):
                             time=list(np.asarray(trajectory.time)[slice_indices]),
                             env_info=list(np.asarray(trajectory.env_info)[slice_indices]) + [trajectory.env_info[max(slice_indices)+1]],
     )
-    return print_trajectory_summary(trajectory=traj_slice, stats=stats, rfp=rfp, opt_model=opt_model)
+    return print_trajectory_summary(trajectory=traj_slice, stats=stats, rfp=rfp, opt_model=opt_model, plot_emissions=True)
 
 if __name__ == '__main__':
     documentation = False # "Backcasting"
     single_experiment_evaluation = False
     document_optimal_strategy = False
+    layout_file="article.xlsx"
+    scenario_name="100"
 
-    experiments = ("backcasting_persistence_DeterministicHA_production_value_ph_96_spot_True_small",)
-    rfp = create_rfp(layout_file = "rfp_layout - resized.xlsx")
+    experiments = ("backcasting_AggregateFullHorizonAgent_ph_96_spot_True_out_of_sample",
+                   "backcasting_DeterministicHA_production_value_ph_96_spot_True_out_of_sample")
+    agents = ("AggregateFullHorizonAgent_ph_96_spot_True_out_of_sample",
+                "DeterministicHA_production_value_ph_96_spot_True_out_of_sample",)
+    train_periods = np.linspace(1,4,19)
+    train_periods = np.concatenate([np.linspace(1,4,19), np.linspace(4.5,10,12)])
+    forecaster_types = [f"SOTA{str(round(float(train_period),2)).replace(".","_")}year" for train_period in train_periods]
+    experiments = [f"{forecaster_type}_{agent}_{scenario_name}" for agent in agents for forecaster_type in forecaster_types]
+
+    rfp = create_rfp(scenario_name=scenario_name, layout_file=layout_file)
+    results_folder = f"setup_files/results/{layout_file.split('.')[0]}"
+    use_optimized_capacities = True
+    if use_optimized_capacities:
+        rfp.set_capacities_from_file(f"{results_folder}/optimal_capacities-chosen.csv")
+    ppa_prices = pd.read_csv(f"{results_folder}/ppa_prices-risk_neutral.csv")
+    for name, ppa in rfp.get_ppas().items():
+        resource = ppa.parameters.get("consumes")
+        if resource in ('wind', 'solar'):
+            price = ppa_prices[resource].iloc[0]
+        else:
+            price = ppa_prices["baseload"].iloc[0]
+        ppa.parameters["price"] = np.round(price, 2)
+
+    # production_distribution = {}
+    # for agent in agents:
+    #     experiment_names = [f"{forecaster_type}_{agent}_100" for forecaster_type in forecaster_types]
+    #     cols = [str(round(float(train_period),2)).replace(".","_") for train_period in train_periods]
+    #     production_dists = pd.DataFrame(columns=cols, index=range(1,13))
+    #     for exp_ix, experiment_name in enumerate(experiment_names):
+    #         trajectory = load_trajectories(experiment_name)[0]
+    #         horizon_days = len(trajectory.reward)
+    #         T = range(1, horizon_days+1)
+    #         power_import = []
+    #         for t in T:
+    #             power_import += list(trajectory.env_info[t]['power_consumption'])
+    #         hourly_index = pd.to_datetime(pd.date_range(start=trajectory.env_info[1]['time'], periods=horizon_days*24, freq='h'))
+    #         monthly_imports = pd.DataFrame(data=power_import, index=hourly_index, columns=["import"]).groupby(hourly_index.month).sum()
+    #         production_dists.iloc[:, exp_ix] = monthly_imports["import"].values
+    #     production_distribution[agent] = production_dists
 
     opt_models = []
     for exp_ix, experiment_name in enumerate(experiments):
@@ -50,7 +88,7 @@ if __name__ == '__main__':
             if year == 2020:
                 print("2020")
             print(f"Evaluating year {year} of experiment {experiment_name}")
-            if exp_ix == 0 or True:
+            if exp_ix == 0:
                 opt_model, trajectory_summary, emissions_summary, capture_price_summary, ppa_capacity_factor = get_yearly_summary(trajectory=trajectories[0], stats=stats[0], rfp=rfp, year=year)
                 opt_models.append(opt_model)
                 if documentation:

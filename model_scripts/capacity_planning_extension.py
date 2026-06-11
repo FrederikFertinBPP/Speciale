@@ -314,10 +314,10 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
 
     def _build_concrete_instance(self, data=None):
         self.inst = self.model.create_instance(data=data)
+        self.inst.datetimes = pd.to_datetime([pyo.value(self.inst.T_datetime[t]) for t in self.inst.T])
+        self.inst.years = self.inst.datetimes.year.unique().values
+        self.inst.n_years = len(self.inst.datetimes.year.unique())
         if self.cvar_formulation:
-            self.inst.datetimes = pd.to_datetime([pyo.value(self.inst.T_datetime[t]) for t in self.inst.T])
-            self.inst.years = self.inst.datetimes.year.unique().values
-            self.inst.n_years = len(self.inst.datetimes.year.unique())
             self.inst.VaR   = pyo.Var(domain=pyo.Reals)
             self.inst.theta = pyo.Var(self.inst.years, domain=pyo.NonNegativeReals)
             self.inst.cvar_constraints = pyo.ConstraintList()
@@ -502,6 +502,66 @@ class CapacityPlanningModel(HourlyDeterministicLPModel):
             annualized_capex = crf(lifetime) * cc
             cost += (annualized_capex + fom) * b.capacity
         return cost
+
+    def _find_IRR(self, earnings):
+        epsilon = 1 # Difference in NPV from 0
+        max_iter=100
+        iter = 0
+        discount_rate = self.discount_rate
+        CapEx = pyo.value(self._capex_cost(self.inst))
+        diff = earnings - CapEx
+        greater_before = diff > 0
+        scaler = 0.01
+        while iter<max_iter and abs(diff) > epsilon:
+            self.discount_rate += scaler if diff>0 else -scaler
+            if self.discount_rate <= 0:
+                break # Does not make sense financially.
+            CapEx = pyo.value(self._capex_cost(self.inst))
+            diff = earnings - CapEx
+            greater_now = diff > 0
+            if greater_before != greater_now:
+                scaler *= 0.1
+                greater_before = greater_now
+            iter+=1
+        IRR = self.discount_rate * 100
+        self.discount_rate = discount_rate
+        return IRR
+
+    def save_operational_earnings(self, filename):
+        def _get_realized_ppa_cost(T):
+            return sum(pyo.value(self.inst.ppaBlocks[ppa].out_flow[t]) * pyo.value(self.inst.ppaBlocks[ppa].price)
+                        for ppa in self.inst.ppas for t in T)
+        def _get_realized_electricity_cost(T):
+            return sum(pyo.value(self.inst.dayaheadBlocks[dayahead].out_flow[t]) * pyo.value(self.inst.electricity_price[t])
+                       for dayahead in self.inst.dayaheads for t in T)
+        def _get_realized_contract_revenue(T):
+            return sum(pyo.value(b.shipment[t]) * pyo.value(b.price) -
+                       (pyo.value(b.contract_shortfall[t]) * pyo.value(b.penalty) if not(b.is_spot_contract) else 0)
+                       for name, b in self.inst.contractBlocks.items() for t in T)
+        TT = {year: [n for n, is_included in enumerate(self.inst.datetimes.year == year) if is_included] for year in self.inst.years}
+        ppa_cost_per_year = {year: _get_realized_ppa_cost(T_set) for year, T_set in TT.items()}
+        electricity_cost_per_year = {year: _get_realized_electricity_cost(T_set) for year, T_set in TT.items()}
+        contract_revenue_per_year = {year: _get_realized_contract_revenue(T_set) for year, T_set in TT.items()}
+        P_omega = {year: contract_revenue_per_year[year] - ppa_cost_per_year[year] - electricity_cost_per_year[year] for year in self.inst.years}
+        pd.DataFrame(index=self.inst.years, data={"Earnings":P_omega,
+                                                  "Contract Revenue": contract_revenue_per_year,
+                                                  "Electricity Cost": electricity_cost_per_year,
+                                                  "PPA cost": ppa_cost_per_year}).to_csv(filename)
+        if self.cvar_formulation:
+            VaR = pyo.value(self.inst.VaR)
+            CVaR = (VaR - 1/(1-self.cvar_alpha) * sum(pyo.value(self.inst.theta[year]) for year in self.inst.years) / self.inst.n_years)
+        else: 
+            VaR = min(list(P_omega.values()))
+            CVaR = VaR
+        ExpV = np.mean(list(P_omega.values()))
+        ExpIRR = self._find_IRR(ExpV)
+        CVaRIRR = self._find_IRR(CVaR)
+        CapEx = pyo.value(self._capex_cost(self.inst))
+        ExpNPV = ExpV - CapEx
+        pd.DataFrame(index=[0], data={"VaR":VaR, "CVaR": CVaR, "ExpValue": ExpV,
+                                      "ExpIRR": ExpIRR, "CVaRIRR": CVaRIRR,
+                                      "CAPEX": CapEx, "ExpNPV": ExpNPV},
+                                      ).to_csv("_KPIs.".join(filename.split(".")))
 
     def save_optimal_capacities(self, filename):
         """

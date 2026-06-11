@@ -186,6 +186,7 @@ if __name__ == '__main__':
                         "backcasting_AggregateFullHorizonAgent_ph_96_spot_True_small",
                         "backcasting_prophet_DeterministicHA_production_value_ph_96_spot_True_small",
                         "backcasting_persistence_DeterministicHA_production_value_ph_96_spot_True_small")
+    experiment_names = ("backcasting_DeterministicHA_production_value_ph_96_spot_True_out_of_sample",)
     # experiment_names = ("test_DeterministicHA_production_value_ph_96_spot_True_small",)
     # experiment_names = ("minload_pwl_DeterministicHA_production_value_ph_96_spot_True_small",
     #                     "minload_pwl_ramp_DeterministicHA_production_value_ph_96_spot_True_small",

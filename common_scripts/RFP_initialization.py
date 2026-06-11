@@ -270,7 +270,7 @@ class RenewableFuelPlant():
         for _, row in df.iterrows():
             component_name = row["component"]
             capacity = row["optimal_capacity"]
-            component = self.get_component(component_name)
+            component = self.get_component(component_name) or self.get_ppa(component_name)
             if component is not None:
                 component.parameters["capacity"] = capacity
 
@@ -309,7 +309,7 @@ def create_rfp(scenario_name:str = "", layout_file:str = "rfp_layout.xlsx") -> R
     
     # Apply scenario modifications
     for _, row in scenario_info.iterrows():
-        if row.get("Scenario Name", "") == scenario_name:
+        if str(row.get("Scenario Name", "")) == str(scenario_name):
             _type = row.get("Changed Type") # contract, ppa, component
             name = row.get("Changed Object")
             parameter = row.get("Changed Parameter")
@@ -320,7 +320,14 @@ def create_rfp(scenario_name:str = "", layout_file:str = "rfp_layout.xlsx") -> R
                 rfp.get_ppa(name).parameters[parameter] = new_value
             elif _type == "component":
                 rfp.get_component(name).parameters[parameter] = new_value
-    
+    for _, row in scenario_info.iterrows():
+        if str(row.get("Scenario Name", "")) == str(scenario_name):
+            parameter = row.get("Changed Parameter")
+            if parameter in ("volume", "volume_buffer"):
+                vol = rfp.get_contract(name).parameters["volume"]
+                buffer = rfp.get_contract(name).parameters["volume_buffer"]
+                rfp.get_contract(name).parameters["min_volume"] = vol * (1-buffer)
+                rfp.get_contract(name).parameters["max_volume"] = vol * (1+buffer)
     return rfp
 
 # if __name__ == "__main__":

@@ -82,12 +82,73 @@ set_plotting_style()
 # documentation_dir = "ppa_only_results"
 
 """ Planning strategy investigations """
-experiments = ("minload_pwl_DeterministicHA_production_value_ph_96_spot_True_small",
-                    "minload_pwl_ramp_DeterministicHA_production_value_ph_96_spot_True_small",
-                    "planningsensitivity_DeterministicHA_production_value_ph_96_spot_True_small",
-                    "test_AggregateFullHorizonAgent_ph_96_spot_True_small")
-colors = ['skyblue', 'steelblue', 'lightcoral', 'indigo']  # Customize as needed
-documentation_dir = "planning_strategy_comparison"
+documentation_dir = "CNS_SOTA_sens_3" # "CNS_sensitivity", "CNS_SOTA_sensitivity", "CNS", "CNS_SOTA_sens_2", "CNS_SOTA_sens_3"
+if documentation_dir == "CNS_sensitivity":
+    experiments = ("minload_pwl_DeterministicHA_production_value_ph_96_spot_True_small",
+                        "minload_pwl_ramp_DeterministicHA_production_value_ph_96_spot_True_small",
+                        "planningsensitivity_DeterministicHA_production_value_ph_96_spot_True_small",
+                        "test_AggregateFullHorizonAgent_ph_96_spot_True_small")
+
+    scenarios = [70, 80, 90, 100, 110, 120]
+    agents = ("backcasting_DeterministicHA_hourly_target_ph_96_spot_True_out_of_sample",
+                "backcasting_AggregateFullHorizonAgent_ph_96_spot_True_out_of_sample",
+                "backcasting_DeterministicHA_production_value_ph_96_spot_True_out_of_sample",
+                "backcasting_RecedingHorizonAgent_ph_96_spot_True_out_of_sample",
+                )
+    experiments = [f"{agent}_{str(scenario)}_years" for agent in agents for scenario in scenarios]
+    colors = ['dodgerblue'] * len(scenarios) + ['darkolivegreen'] * len(scenarios) + ['darkmagenta'] * len(scenarios) + ['saddlebrown'] * len(scenarios) # Customize as needed
+elif documentation_dir == "CNS":
+    experiments = ("backcasting_DeterministicHA_hourly_target_ph_96_spot_True_out_of_sample",
+                   "backcasting_DeterministicHA_production_value_ph_96_spot_True_out_of_sample",
+                   "backcasting_AggregateFullHorizonAgent_ph_96_spot_True_out_of_sample",
+                   "backcasting_RecedingHorizonAgent_ph_96_spot_True_out_of_sample",
+                   )
+    experiments = (exp + "_years" for exp in experiments)
+    colors = ['skyblue', 'steelblue', 'lightcoral', 'indigo']  # Customize as needed
+elif documentation_dir == "CNS_SOTA_sensitivity":
+    scenarios = [70, 80, 90, 100, 110, 120]
+    agents = ("SOTA1year_AggregateFullHorizonAgent_ph_96_spot_True_out_of_sample",      
+                "backcasting_AggregateFullHorizonAgent_ph_96_spot_True_out_of_sample",
+                "SOTA3year_AggregateFullHorizonAgent_ph_96_spot_True_out_of_sample",
+                "SOTA1year_DeterministicHA_production_value_ph_96_spot_True_out_of_sample",
+                "backcasting_DeterministicHA_production_value_ph_96_spot_True_out_of_sample",
+                "SOTA3year_DeterministicHA_production_value_ph_96_spot_True_out_of_sample",
+                "SOTA1year_DeterministicHA_hourly_target_ph_96_spot_True_out_of_sample",
+                "backcasting_DeterministicHA_hourly_target_ph_96_spot_True_out_of_sample",
+                "SOTA3year_DeterministicHA_hourly_target_ph_96_spot_True_out_of_sample",
+                )
+    agent_names = ["Aggregate\n1yr",
+                   "Aggregate\n2yr",
+                   "Aggregate\n3yr",
+                   "ISP\n1yr",
+                   "ISP\n2yr",
+                   "ISP\n3yr",
+                   "Fixed\n1yr",
+                   "Fixed\n2yr",
+                   "Fixed\n3yr",
+                   ]
+    experiments = [f"{agent}_{str(scenario)}_years" for agent in agents for scenario in scenarios]
+    colors = ['dodgerblue'] * len(scenarios) + ['blue'] * len(scenarios) + ['darkblue'] * len(scenarios) + \
+             ['limegreen'] * len(scenarios) + ['green'] * len(scenarios) + ['darkolivegreen'] * len(scenarios) + \
+             ["orchid"] * len(scenarios) + ["mediumorchid"] * len(scenarios) + ["darkorchid"] * len(scenarios) # Customize as needed
+if documentation_dir == "CNS_SOTA_sens_2":
+    train_periods = np.linspace(1,4,19)
+    train_periods = np.concatenate([np.linspace(1,4,19), np.linspace(4.5,10,12)])
+    agents = ("AggregateFullHorizonAgent_ph_96_spot_True_out_of_sample",
+                "DeterministicHA_production_value_ph_96_spot_True_out_of_sample",)
+    agent_names = ["Aggregative", "ISP"]
+    forecaster_types = [f"SOTA{str(round(float(train_period),2)).replace(".","_")}year" for train_period in train_periods]
+    experiments = [f"{forecaster_type}_{agent}_100_years" for agent in agents for forecaster_type in forecaster_types]
+    colors = ['darkolivegreen'] * len(forecaster_types) + ['darkmagenta'] * len(forecaster_types) # Customize as needed
+if documentation_dir == "CNS_SOTA_sens_3":
+    train_periods = np.linspace(1,4,19)
+    train_periods = np.concatenate([np.linspace(1,4,19), np.linspace(4.5,10,12)])
+    agents = ("AggregateFullHorizonAgent_ph_96_spot_True_out_of_sample",
+                "DeterministicHA_production_value_ph_96_spot_True_out_of_sample",)
+    agent_names = ["Aggregative", "ISP"]
+    forecaster_types = [f"SOTA{str(round(float(train_period),2)).replace(".","_")}year" for train_period in train_periods]
+    experiments = [f"{forecaster_type}_{agent}_flexible_contract_years" for agent in agents for forecaster_type in forecaster_types]
+    colors = ['darkolivegreen'] * len(forecaster_types) + ['darkmagenta'] * len(forecaster_types) # Customize as needed
 
 exp_ebitda = {}
 VaR_90_ebitda = {}
@@ -102,6 +163,8 @@ VaR_90_percentages = {}
 results_dict = {}
 cp_dict = {}
 
+plot_individual_experiments = False
+
 for experiment_name in experiments:
     f = experiment_name.split("_")
     if documentation_dir in ["profit_dists", "intraday_bidding_strategies"]:
@@ -115,85 +178,86 @@ for experiment_name in experiments:
     # results2 = pd.read_csv(f"evaluation_scripts/processed_results/{experiment_name2}.csv")
     results_cp = pd.read_csv(f"evaluation_scripts/processed_results/{experiment_name}/capture_price_summary.csv")
     cp_dict[name] = results_cp
-
-    fig, ax = plt.subplots(figsize=(16,12))
-    sns.histplot(results["Profit Percentage [%]"], label="Obtained profits", color="red", alpha=0.8, bins=12)
-    plt.axvline(np.mean(results["Profit Percentage [%]"]), label="Average obtained profit", lw=5, color='darkred')
-    plt.xlabel(f"% of optimal profits")
-    plt.ylabel("Occurences")
-    plt.legend()
-    plt.savefig(os.path.join(scenario_dir, "percentages.png"))
-    plt.close()
     exp_percentages[name] = np.mean(results["Profit Percentage [%]"])
     VaR_90_percentages[name] = np.percentile(results["Profit Percentage [%]"],10)
-
-    fig, ax = plt.subplots(figsize=(16,12))
-    sns.histplot(results["EBITDA [€]"].values/1e6, label="EBITDA", color="green", alpha=0.8, bins=12)
-    plt.axvline(np.mean(results["EBITDA [€]"].values)/1e6, label="Average EBITDA", lw=5, color='darkgreen')
-    plt.axvline(np.percentile(results["EBITDA [€]"].values, 10)/1e6, label="P90 EBITDA", lw=5, color='black')
-    plt.xlabel(f"€ (million)")
-    plt.ylabel("Occurences")
-    plt.legend()
-    plt.savefig(os.path.join(scenario_dir, "EBITDA.png"))
-    plt.close()
     exp_ebitda[name] = np.mean(results["EBITDA [€]"].values)/1e6
     VaR_90_ebitda[name] = np.percentile(results["EBITDA [€]"].values, 10)/1e6
-
-    fig, ax = plt.subplots(figsize=(16,12))
-    sns.histplot(results["Optimal Profit [€]"].values/1e6, label="Optimal profits", color="blue", alpha=0.8, bins=12)
-    plt.axvline(np.mean(results["Optimal Profit [€]"].values)/1e6, label="Average optimal profit", lw=5, color='darkblue')
-    sns.histplot(results["EBITDA [€]"].values/1e6, label="Obtained profits", color="green", alpha=0.8, bins=12)
-    plt.axvline(np.mean(results["EBITDA [€]"].values)/1e6, label="Average obtained profit", lw=5, color='darkgreen')
-    plt.xlabel(f"€ (million)")
-    plt.ylabel("Occurences")
-    plt.legend()
-    plt.savefig(os.path.join(scenario_dir, "real_and_opt.png"))
-    plt.close()
-
-    fig, ax = plt.subplots(figsize=(16,12))
-    plt.scatter(results["Optimal Profit [€]"].values/1e6, results["EBITDA [€]"].values/1e6, label="Scenarios", color="green", alpha=0.8, s=50)
-    plt.xlabel("Optimal Profits [€ (million)]")
-    plt.ylabel("Realized Profits [€ (million)]")
-    plt.legend()
-    plt.savefig(os.path.join(scenario_dir, "real_and_opt_scatter.png"))
-    plt.close()
-
-    fig, ax = plt.subplots(figsize=(16,12))
-    sns.histplot(results["Optimal Profit [€]"].values/1e6, label="Optimal profits", color="blue", alpha=0.8, bins=12)
-    plt.xlabel("€ (million)")
-    plt.ylabel("Occurences")
-    plt.legend()
-    plt.savefig(os.path.join(scenario_dir, "optimals.png"))
-    plt.close()
-
-    fig, ax = plt.subplots(figsize=(16,12))
-    sns.histplot(results["Short Exposure [%]"].values, label="Short Exposure", color="green", alpha=0.5, bins=12)
-    # sns.histplot(results["Short Exposure"].values, label="Short Exposure (Stoch. Agent)", color="blue", alpha=0.5, bins=12)
-    sns.histplot(results["Long Exposure [%]"].values, label="Long Exposure", color="red", alpha=0.5, bins=12)
-    # sns.histplot(results["Long Exposure"].values, label="Long Exposure (Stoch. Agent)", color="blue", alpha=0.5, bins=12)
-    # if np.max(results["Balancing Exposure [%]"].values) > 0:
-    #     sns.histplot(results["Balancing Exposure [%]"].values, label="Balancing Exposure", color="blue", alpha=0.5, bins=12)
-    # sns.histplot(results["Balancing Exposure"].values, label="Balancing Exposure (Stoch. Agent)", color="blue", alpha=0.5, bins=12)
-    plt.xlabel("Exposure")
-    plt.ylabel("Occurences")
-    plt.legend()
-    plt.savefig(os.path.join(scenario_dir, "exposure.png"))
-    plt.close()
     short_exposure[name] = np.mean(results["Short Exposure [%]"].values)
     long_exposure[name] = np.mean(results["Long Exposure [%]"].values)
     balancing_exposure[name] = np.mean(results["Balancing Exposure [%]"].values)
-
-    fig, ax = plt.subplots(figsize=(16,12))
-    sns.histplot(results["Cost Exposure [%]"].values, label="Cost Exposure", color="green", alpha=0.5, bins=12)
-    sns.histplot(results["Revenue Exposure [%]"].values, label="Revenue Exposure", color="red", alpha=0.5, bins=12)
-
-    plt.xlabel("Exposure")
-    plt.ylabel("Occurences")
-    plt.legend()
-    plt.savefig(os.path.join(scenario_dir, "exposure_CR.png"))
-    plt.close()
     cost_exposure[name] = np.mean(results["Cost Exposure [%]"].values)
     revenue_exposure[name] = np.mean(results["Revenue Exposure [%]"].values)
+
+    if plot_individual_experiments:
+        fig, ax = plt.subplots(figsize=(16,12))
+        sns.histplot(results["Profit Percentage [%]"], label="Obtained profits", color="red", alpha=0.8, bins=12)
+        plt.axvline(np.mean(results["Profit Percentage [%]"]), label="Average obtained profit", lw=5, color='darkred')
+        plt.xlabel(f"% of optimal profits")
+        plt.ylabel("Occurences")
+        plt.legend()
+        plt.savefig(os.path.join(scenario_dir, "percentages.png"))
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(16,12))
+        sns.histplot(results["EBITDA [€]"].values/1e6, label="EBITDA", color="green", alpha=0.8, bins=12)
+        plt.axvline(np.mean(results["EBITDA [€]"].values)/1e6, label="Average EBITDA", lw=5, color='darkgreen')
+        plt.axvline(np.percentile(results["EBITDA [€]"].values, 10)/1e6, label="P90 EBITDA", lw=5, color='black')
+        plt.xlabel(f"€ (million)")
+        plt.ylabel("Occurences")
+        plt.legend()
+        plt.savefig(os.path.join(scenario_dir, "EBITDA.png"))
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(16,12))
+        sns.histplot(results["Optimal Profit [€]"].values/1e6, label="Optimal profits", color="blue", alpha=0.8, bins=12)
+        plt.axvline(np.mean(results["Optimal Profit [€]"].values)/1e6, label="Average optimal profit", lw=5, color='darkblue')
+        sns.histplot(results["EBITDA [€]"].values/1e6, label="Obtained profits", color="green", alpha=0.8, bins=12)
+        plt.axvline(np.mean(results["EBITDA [€]"].values)/1e6, label="Average obtained profit", lw=5, color='darkgreen')
+        plt.xlabel(f"€ (million)")
+        plt.ylabel("Occurences")
+        plt.legend()
+        plt.savefig(os.path.join(scenario_dir, "real_and_opt.png"))
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(16,12))
+        plt.scatter(results["Optimal Profit [€]"].values/1e6, results["EBITDA [€]"].values/1e6, label="Scenarios", color="green", alpha=0.8, s=50)
+        plt.xlabel("Optimal Profits [€ (million)]")
+        plt.ylabel("Realized Profits [€ (million)]")
+        plt.legend()
+        plt.savefig(os.path.join(scenario_dir, "real_and_opt_scatter.png"))
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(16,12))
+        sns.histplot(results["Optimal Profit [€]"].values/1e6, label="Optimal profits", color="blue", alpha=0.8, bins=12)
+        plt.xlabel("€ (million)")
+        plt.ylabel("Occurences")
+        plt.legend()
+        plt.savefig(os.path.join(scenario_dir, "optimals.png"))
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(16,12))
+        sns.histplot(results["Short Exposure [%]"].values, label="Short Exposure", color="green", alpha=0.5, bins=12)
+        # sns.histplot(results["Short Exposure"].values, label="Short Exposure (Stoch. Agent)", color="blue", alpha=0.5, bins=12)
+        sns.histplot(results["Long Exposure [%]"].values, label="Long Exposure", color="red", alpha=0.5, bins=12)
+        # sns.histplot(results["Long Exposure"].values, label="Long Exposure (Stoch. Agent)", color="blue", alpha=0.5, bins=12)
+        # if np.max(results["Balancing Exposure [%]"].values) > 0:
+        #     sns.histplot(results["Balancing Exposure [%]"].values, label="Balancing Exposure", color="blue", alpha=0.5, bins=12)
+        # sns.histplot(results["Balancing Exposure"].values, label="Balancing Exposure (Stoch. Agent)", color="blue", alpha=0.5, bins=12)
+        plt.xlabel("Exposure")
+        plt.ylabel("Occurences")
+        plt.legend()
+        plt.savefig(os.path.join(scenario_dir, "exposure.png"))
+        plt.close()
+
+        fig, ax = plt.subplots(figsize=(16,12))
+        sns.histplot(results["Cost Exposure [%]"].values, label="Cost Exposure", color="green", alpha=0.5, bins=12)
+        sns.histplot(results["Revenue Exposure [%]"].values, label="Revenue Exposure", color="red", alpha=0.5, bins=12)
+
+        plt.xlabel("Exposure")
+        plt.ylabel("Occurences")
+        plt.legend()
+        plt.savefig(os.path.join(scenario_dir, "exposure_CR.png"))
+        plt.close()
 
 if documentation_dir == "profit_dists":
     labels=["PS I\nBS None", "PS II\nBS None", "PS II\nBS None*", "PS II\nBS I",
@@ -532,6 +596,236 @@ if documentation_dir == "scenario_comparisons":
     fig.tight_layout(rect=[0,0.1,1,1])
     plt.savefig(f"documentation/{documentation_dir}/scatterplots.png")
     plt.close()
+
+if documentation_dir == "CNS_sensitivity":
+    df = pd.DataFrame()
+    for name, r in results_dict.items():
+        df[name] = r["Profit Percentage [%]"]
+    agent_names = ["Fixed",
+                   "Aggregative",
+                   "ISP",
+                   "Receding"]
+    fig, ax = plt.subplots(figsize=(12,8))
+    box = sns.violinplot(df.values, palette=colors, ax=ax)
+    x = np.arange(len(df.columns))
+    ax.set_xticks(x)
+    xticklabels = [str(scenario)+"kt" + ("\n"+str(agent) if scenario == 90 else "") for agent in agent_names for scenario in scenarios] 
+    ax.set_xticklabels(xticklabels)
+    ax.set_yticks(ax.get_yticks())
+    yticklabels = [ytick._text + "%" for ytick in ax.get_yticklabels()]
+    ax.set_yticklabels(yticklabels, rotation=90)
+    ax.set_ylim(top=100)
+    plt.tight_layout()
+    plt.savefig(f"documentation/{documentation_dir}/percentage_violinplots.png")
+    plt.close()
+
+    df_ebitda = pd.DataFrame()
+    df_se = pd.DataFrame()
+    df_le = pd.DataFrame()
+    df_optimals = pd.DataFrame()
+    df_default_magnitude = []
+    df_default_rate = []
+    # Numpy division where dividing by zero results in 0
+    zero_safe_divide = np.vectorize(lambda x, y: x / y if y != 0 else 0)
+
+    for name, r in results_dict.items():
+        df_optimals[name] = r["Optimal Profit [€]"]/1e6
+        df_ebitda[name] = r["EBITDA [€]"]/1e6
+        df_se[name] = r["Short Exposure [%]"]*100
+        df_le[name] = r["Long Exposure [%]"]*100
+        df_default_magnitude.append(np.round(zero_safe_divide(np.sum(r["Contract Defaulting [€]"]/3600), np.sum(r["Contract Defaulting [€]"]>-0.1)),2))
+        df_default_rate.append(100*zero_safe_divide(np.sum(r["Contract Defaulting [€]"]>0), len(r["Contract Defaulting [€]"])))
+    dfs = [df_ebitda, df_default_magnitude, df_le, df_se,]
+    dfs_names = ["EBITDA [€ million]", r"Defaulted Volume [t NH$_3$]", "Long Exposure [%]", "Short Exposure [%]", ]
+
+    fig, axs = plt.subplots(2, 2, figsize=(15,15))
+    x = [scenario for scenario in scenarios]
+    axs = axs.flatten()
+    for jx, (dfi, dfi_name) in enumerate(zip(dfs, dfs_names)):
+        ax = axs[jx]
+        #if dfi_name == r"Defaulting Magnitude [t NH$_3$]":
+            #ax2=ax.twinx()
+            #ax2.set_ylabel("Defaulting Rate [%]")
+            #ax2.set_ylim(-5,100)
+        for ix, agent in enumerate(agents):
+            slice_ = (len(scenarios)*ix,len(scenarios)*(ix+1))
+            if dfi_name == r"Defaulted Volume [t NH$_3$]":
+                df_ = pd.Series(dfi).iloc[slice_[0]:slice_[1]]
+                # box = ax.scatter(x, df_, color=colors[slice_[0]:slice_[1]], marker="x", s=100, label=agent_names[ix])
+                box = ax.plot(x, df_, color=colors[slice_[0]], marker="o", lw=2, markersize=10, label=agent_names[ix])
+                #df_ = pd.Series(df_default_rate).iloc[slice_[0]:slice_[1]]
+                #box = ax2.plot(x, df_, color=colors[slice_[0]], marker="x", lw=2, markersize=10, label=agent_names[ix])
+            else:
+                df_ = dfi.iloc[:,slice_[0]:slice_[1]]
+                # box = ax.scatter(x, df_.mean(axis=0), color=colors[slice_[0]:slice_[1]], marker="x", s=100, label=agent_names[ix])
+                box = ax.plot(x, df_.mean(axis=0), color=colors[slice_[0]], marker="o", markersize=10, label=agent_names[ix])
+                if dfi_name == "EBITDA [€ million]":
+                    #ax.fill_between(x, df_.quantile(0.2, axis=0), df_.quantile(0.8, axis=0), color=colors[slice_[0]], alpha=0.2)
+                    if ix==len(agents)-1:
+                        df_ = df_optimals.iloc[:,slice_[0]:slice_[1]]
+                        box = ax.plot(x, df_.mean(axis=0), color='black', marker="o", markersize=10, label="Hindsight\nOptimal")
+                        ax.set_ylim(bottom=0)
+        ax.set_xticks(x)
+        ax.set_xlabel(r"Contracted Volume [kt NH$_3$/yr]")
+        ax.set_ylabel(dfi_name)
+    hl, lb = axs[0].get_legend_handles_labels()
+    fig.legend(hl, lb, ncol=len(agents)+1, bbox_to_anchor=(0.5,0.1), loc="upper center")
+    fig.tight_layout(rect=[0,0.1,1,1])
+    plt.savefig(f"documentation/{documentation_dir}/scatterplots.png")
+    plt.close()
+
+    fig, ax = plt.subplots(figsize=(12,8))
+    x = np.asarray(x)
+    (dfi, dfi_name) = dfs[0], dfs_names[0]
+    for ix, agent in enumerate(agents):
+        slice_ = (len(scenarios)*ix,len(scenarios)*(ix+1))
+        df_ = dfi.iloc[:,slice_[0]:slice_[1]]
+        # box = ax.scatter(x, df_.mean(axis=0), color=colors[slice_[0]:slice_[1]], marker="x", s=100, label=agent_names[ix])
+        box = ax.plot(x, df_.mean(axis=0), color=colors[slice_[0]], marker="o", markersize=10, label=agent_names[ix])
+        if dfi_name == "EBITDA [€ million]":
+            #ax.fill_between(x, df_.quantile(0.2, axis=0), df_.quantile(0.8, axis=0), color=colors[slice_[0]], alpha=0.2)
+            if ix==len(agents)-1:
+                df_ = df_optimals.iloc[:,slice_[0]:slice_[1]]
+                box = ax.plot(x, df_.mean(axis=0), color='black', marker="o", markersize=10, label="Hindsight")
+    ax.set_xlim(x[0]-5,x[-1]+5)
+    ax.set_xticks(x)
+    ax.set_xlabel(r"Contracted Volume [kt NH$_3$/yr]")
+    ax.set_ylabel(dfi_name)
+    ax.legend(ncol=1, loc="best", fontsize=18)
+    x_lims = ax.get_xlim()
+    ax2 = ax.twiny()
+    ax2.grid(False)
+    conv = lambda x: ((x*1000) / (15.9242*8760) * 100).astype(int)
+    ticks = conv(x)
+    ax2.set_xticks(ticks)
+    ax2.tick_params(axis='x', labelcolor='black')
+    ax2.set_xlim(left=conv(x_lims[0]), right=conv(x_lims[1]))
+    ax2.spines["top"].set_position(("outward", 0))
+    ax2.set_xlabel(r"Fuel synthesis - CF (%)")
+    # ax.set_ylim(bottom=0)
+    # fig.tight_layout(rect=[0,0.1,1,1])
+    ax.set_ylim(bottom=20, top=45)
+    plt.tight_layout()
+    plt.savefig(f"documentation/{documentation_dir}/scatterplot.png")
+    plt.close()
+
+if documentation_dir == "CNS_SOTA_sensitivity":
+    df = pd.DataFrame()
+    for name, r in results_dict.items():
+        df[name] = r["Profit Percentage [%]"]
+    df_ebitda = pd.DataFrame()
+    df_se = pd.DataFrame()
+    df_le = pd.DataFrame()
+    df_optimals = pd.DataFrame()
+    df_default_magnitude = []
+    df_default_rate = []
+    # Numpy division where dividing by zero results in 0
+    zero_safe_divide = np.vectorize(lambda x, y: x / y if y != 0 else 0)
+    for name, r in results_dict.items():
+        df_optimals[name] = r["Optimal Profit [€]"]/1e6
+        df_ebitda[name] = r["EBITDA [€]"]/1e6
+        df_se[name] = r["Short Exposure [%]"]*100
+        df_le[name] = r["Long Exposure [%]"]*100
+        df_default_magnitude.append(np.round(zero_safe_divide(np.sum(r["Contract Defaulting [€]"]/3600), np.sum(r["Contract Defaulting [€]"]>-0.1)),2))
+        df_default_rate.append(100*zero_safe_divide(np.sum(r["Contract Defaulting [€]"]>0), len(r["Contract Defaulting [€]"])))
+    dfi = df_ebitda
+    dfi_name = "EBITDA [€ million]"
+
+    ebitdas = np.asarray(dfi.values).reshape(len(agents), len(forecaster_types))
+    fig, ax = plt.subplots(figsize=(12,8))
+    # sns.boxplot(data=ebitdas.T, palette=["red", "blue"], ax=ax)
+
+    x = np.asarray([scenario for scenario in scenarios])
+    for ix, agent in enumerate(agents):
+        slice_ = (len(scenarios)*ix,len(scenarios)*(ix+1))
+        df_ = dfi.iloc[:,slice_[0]:slice_[1]]
+        # box = ax.scatter(x, df_.mean(axis=0), color=colors[slice_[0]:slice_[1]], marker="x", s=100, label=agent_names[ix])
+        box = ax.plot(x, df_.mean(axis=0), color=colors[slice_[0]], marker="o", markersize=10, label=agent_names[ix])
+        if ix==len(agents)-1:
+            df_ = df_optimals.iloc[:,slice_[0]:slice_[1]]
+            box = ax.plot(x, df_.mean(axis=0), color='black', marker="o", markersize=10, label="Hindsight\nOptimal")
+    ax.set_xlim(x[0]-5,x[-1]+5)
+    ax.set_xticks(x)
+    ax.set_xlabel(r"Contracted Volume [kt NH$_3$/yr]")
+    ax.set_ylabel(dfi_name)
+    ax.legend(ncol=len(agents)+1, loc="best", fontsize=14)
+    x_lims = ax.get_xlim()
+    ax2 = ax.twiny()
+    ax2.grid(False)
+    conv = lambda x: ((x*1000) / (15.9242*8760) * 100).astype(int)
+    ticks = conv(x)
+    ax2.set_xticks(ticks)
+    ax2.tick_params(axis='x', labelcolor='black')
+    ax2.set_xlim(left=conv(x_lims[0]), right=conv(x_lims[1]))
+    ax2.spines["top"].set_position(("outward", 0))
+    ax2.set_xlabel(r"Fuel synthesis - CF (%)")
+    # ax.set_ylim(bottom=0)
+    # fig.tight_layout(rect=[0,0.1,1,1])
+    ax.set_ylim(bottom=15)
+    plt.tight_layout()
+    plt.savefig(f"documentation/{documentation_dir}/scatterplot.png")
+    plt.close()
+
+if documentation_dir == "CNS_SOTA_sens_2" or documentation_dir == "CNS_SOTA_sens_3":
+    df_ebitda = pd.DataFrame()
+    for name, r in results_dict.items():
+        df_ebitda[name] = r["EBITDA [€]"]/1e6
+    dfi = df_ebitda
+    dfi_name = "EBITDA [€ million]"
+    
+    ebitdas = np.asarray(dfi.values).reshape(len(agents), len(forecaster_types))
+    pd.DataFrame(data=ebitdas.T, columns=agent_names).to_csv(f"documentation/{documentation_dir}/ebitdas.csv")
+    fig, ax = plt.subplots(figsize=(12,8))
+    sns.boxplot(data=ebitdas.T, palette=["darkolivegreen", "darkmagenta"],
+                fill=False, ax=ax, linewidth=3, zorder=0,
+                boxprops={"alpha":0.5}, flierprops={"alpha":0.5}, whiskerprops={"alpha":0.5},
+                medianprops={"alpha":0.5}, capprops={"alpha":0.5}, capwidths=0.3)
+    sns.scatterplot(x=[0]*len(forecaster_types),y=ebitdas[0,:], color="darkolivegreen", ax=ax)
+    sns.scatterplot(x=[1]*len(forecaster_types),y=ebitdas[1,:], color="darkmagenta", ax=ax)
+    sns.scatterplot(x=[0,1],y=np.mean(ebitdas,axis=1), color=["darkolivegreen","darkmagenta"], ax=ax, marker="x", s=300)
+    ax.set_ylabel("M€")
+    ax.set_xticks([0,1])
+    ax.set_xticklabels(agent_names,fontweight="bold")
+    ax.set_ylim(32,42)
+
+    plt.tight_layout()
+    plt.savefig(f"documentation/{documentation_dir}/ebitda_boxplot_comparison.png")
+    plt.close()
+
+    df = pd.read_excel("setup_files/results/article_updated/earnings boxplot.xlsx")
+    CVaR = df.values[1:11,1]
+    neutral = df.values[13:,1]
+    ebitdas2 = np.asarray([neutral, CVaR])
+    ebitdas2 = ebitdas2.astype(float)
+    fig, ax = plt.subplots(figsize=(12,8))
+    sns.boxplot(data=ebitdas2.T/10**6, palette=["green", "blue"],
+                fill=False, ax=ax, linewidth=3, zorder=0,
+                boxprops={"alpha":0.5}, flierprops={"alpha":0.5}, whiskerprops={"alpha":0.5},
+                medianprops={"alpha":0.5}, capprops={"alpha":0.5}, capwidths=0.3)
+    sns.scatterplot(x=[0]*len(CVaR),y=ebitdas2[0,:]/10**6, color="darkgreen", ax=ax)
+    sns.scatterplot(x=[1]*len(CVaR),y=ebitdas2[1,:]/10**6, color="darkblue", ax=ax)
+    sns.scatterplot(x=[0,1],y=np.mean(ebitdas2,axis=1)/10**6, color=["darkgreen","darkblue"],
+                    ax=ax, marker="x", s=300)
+    ax.set_ylabel("M€")
+    ax.set_xticks([0,1])
+    ax.set_xticklabels(["Risk-Neutral", "CVaR-Aware"], fontweight="bold")
+    ax.set_ylim(0,160)
+
+    plt.tight_layout()
+    plt.savefig(f"documentation/{documentation_dir}/ebitdas_insample.png")
+    plt.close()
+
+    fig,ax = plt.subplots(figsize=(12,8))
+    plt.scatter(train_periods, ebitdas[0,:],label="Aggregative")
+    plt.scatter(train_periods, ebitdas[1,:],label="ISP")
+    plt.legend()
+    plt.xlabel("Training Period (years)")
+    plt.ylabel("M€")
+    plt.tight_layout()
+    plt.savefig(f"documentation/{documentation_dir}/ebitdas_dependent_on_train_period.png")
+    plt.close()
+
+
 
 df = pd.DataFrame()
 for name, r in results_dict.items():

@@ -1,16 +1,4 @@
 #%% Initialization
-from data_scripts.data_loader import DataLoader
-from data_scripts.analysis_functions import plot_acf
-from common_scripts.utils import cache_exists, cache_read, cache_write, log_transform, laplace_rnd
-from common_scripts.RFP_initialization import RenewableFuelPlant
-
-from sklearn.linear_model import LinearRegression
-from xgboost import XGBRegressor
-from sklearn.metrics import root_mean_squared_error, mean_absolute_error
-from hmmlearn import hmm
-from sklearn.preprocessing import StandardScaler
-
-import statsmodels.api as sm
 import pandas as pd
 from dateutil.relativedelta import relativedelta
 import numpy as np
@@ -18,7 +6,14 @@ import os
 import matplotlib.pyplot as plt
 from time import time
 from tqdm import tqdm
-from collections import deque
+
+from sklearn.linear_model import LinearRegression
+from hmmlearn import hmm
+import statsmodels.api as sm
+
+from data_scripts.data_loader import DataLoader
+from common_scripts.RFP_initialization import RenewableFuelPlant
+from common_scripts.utils import cache_exists, cache_read, cache_write, log_transform, laplace_rnd
 
 # ---------------------------------------------------------------------------
 # Base simulation class
@@ -309,7 +304,7 @@ class PriceSimulationTool(SimulationTool):
                  t_zero: float = None,
                  specify_time_data=None,
                  create_seasonal_features=None,
-                 exog_model: LinearRegression | XGBRegressor = None,
+                 exog_model: LinearRegression = None,
                  stochastic_model: str = 'GARCH',
                  **kwargs):
         super().__init__(target_tag=price_tag, **kwargs)
@@ -357,6 +352,7 @@ class PriceSimulationTool(SimulationTool):
         fitted_residuals   = residuals - merit_order_effect.reshape(-1, 1)
 
         if self.verbose:
+            from sklearn.metrics import root_mean_squared_error
             print('RMSE of WSS fit (train):', root_mean_squared_error(residuals, merit_order_effect))
         if self.documentation:
             self._plot_deseason(
@@ -498,6 +494,7 @@ class PriceSimulationTool(SimulationTool):
             residuals = self._calculate_rs_probabilities(residuals)
             residuals.index.freq = 'h'
             if self.documentation:
+                from data_scripts.analysis_functions import plot_acf
                 self._investigate_heteroskedasticity(residuals)
                 plot_acf(residuals)
             if self.stochastic_model in ('SARIMAX', 'ARIMAX'):
@@ -548,7 +545,7 @@ class PriceSimulationTool(SimulationTool):
         df = exog_profiles.copy()
 
         if self.stochastic_model in ('ARIMA', 'ARIMAX', 'SARIMA', 'SARIMAX'):
-            if self.stochastic_model == ('ARIMA', 'SARIMA'):
+            if self.stochastic_model in ('ARIMA', 'SARIMA'):
                 X = None
                 # X = self.fourier_terms(df.index.hour, period=self.fourier_period, K=self.fourier_order)
             elif self.stochastic_model in ('ARIMAX', 'SARIMAX'):
@@ -730,6 +727,7 @@ class SolarSimulationTool(RenewablesSimulationTool):
         self.daily_residuals           = daily_max
         self.daily_residuals.index.freq = 'D'
         if self.documentation:
+            from data_scripts.analysis_functions import plot_acf
             plot_acf(self.daily_residuals)
 
         # Hourly residuals
@@ -845,7 +843,7 @@ class WindSimulationTool(RenewablesSimulationTool):
     # Fitting
     # ------------------------------------------------------------------
     
-    def fit(self):
+    def fit(self, old_model=None):
         capacity_factors       = self._del_capacity_trend(self.data[[self.target_tag]].copy())
 
         self.min_historical_production = float(np.min(capacity_factors))
@@ -854,6 +852,7 @@ class WindSimulationTool(RenewablesSimulationTool):
         residuals = self._deseasonalise(capacity_factors)
 
         if self.documentation:
+            from data_scripts.analysis_functions import plot_acf
             plot_acf(residuals)
 
         prev = residuals.shift(1).fillna(residuals.iloc[0][self.target_tag])
@@ -862,7 +861,8 @@ class WindSimulationTool(RenewablesSimulationTool):
         if self.hmm: # Does not work
             self._fit_hmm(residuals, diff1)
         else:
-            self.arima_model = self._fit_arima_model(diff1, order=(1, 0, 1))
+            old_arima = old_model.arima_model if old_model is not None else None
+            self.arima_model = self._fit_arima_model(diff1, order=(1, 0, 1), old_model=old_arima)
             self.ar_term = self.arima_model.params["ar.L1"]
             self.ma_term = self.arima_model.params["ma.L1"]
 
@@ -1422,6 +1422,7 @@ class DataForecaster:
     def build_simulation_models(self, old_forecaster=None, to_pickle: bool = False):
         old_solar = old_forecaster.solar_model if old_forecaster else None
         old_price = old_forecaster.price_model if old_forecaster else None
+        old_wind = old_forecaster.wind_model if old_forecaster else None
 
         self.solar_model = SolarSimulationTool(
             data=self.data, caps=self.database.caps, vre_tag=self.solar_tag,
@@ -1431,7 +1432,7 @@ class DataForecaster:
         self.wind_model = WindSimulationTool(
             data=self.data, caps=self.database.caps, vre_tag=self.wind_tag,
             weather_years=self.weather_years, **self._tool_kwargs)
-        self.wind_model.fit()
+        self.wind_model.fit(old_wind)
         
         self.load_model = LoadForecaster(
             data=self.data, load_tag=self.load_tag,

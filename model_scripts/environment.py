@@ -1,38 +1,39 @@
-
+import os
 import gymnasium as gym
 import numpy as np
 import pandas as pd
-from collections import deque
-from common_scripts.utils import cache_read, expando
-from common_scripts.RFP_initialization import RenewableFuelPlant, create_rfp
+from common_scripts.RFP_initialization import RenewableFuelPlant
 from data_scripts.data_generator_v2 import DataForecaster
-from sklearn.preprocessing import MinMaxScaler
+from data_scripts.data_loader import HistoricalData
 from time import time as get_unix_time
-import copy
-from dateutil.relativedelta import relativedelta
-import os
 from model_scripts.hourly_models import ShieldLPModel, HourlyDeterministicLPModel, HourlyRecourseModel, ShieldRecourseModel
 
 def get_env(env_class:gym.Env,
             env_config:dict={},
-            scenario_name:str="default",
+            scenario_name:str="",
             data_cache_id:str="Anders",
-            layout_file:str="rfp_layout.xlsx",
+            layout_file:str="article.xlsx",
             use_optimized_capacities = False,
             ):
+    from common_scripts.RFP_initialization import create_rfp
     rfp = create_rfp(scenario_name=scenario_name, layout_file=layout_file)
     if use_optimized_capacities:
-        rfp.set_capacities_from_file(f"setup_files/optimal_capacities_{layout_file.split('.')[0]}_{scenario_name}.csv")
+        rfp.set_capacities_from_file(f"setup_files/results/{layout_file.split('.')[0]}/optimal_capacities-chosen.csv")
 
-    forecaster = DataForecaster(from_pickle=True, cache_id=data_cache_id)
-    forecaster = forecaster.unpickle()
-    forecaster.t_init = forecaster.test_data.index[0]
     if env_config.get("load_data", False):
+        start   = pd.Timestamp('20150101', tz='UTC')
+        end     = pd.Timestamp('20251231', tz='UTC')
+        data_object = HistoricalData(start=start, end=end, country_code='PT', server='ENTSOE', create_time_features=False)
+        from common_scripts.utils import expando
         forecaster_shell = expando()
-        forecaster_shell.t_init = forecaster.t_init
-        forecaster_shell.cache_id = forecaster.cache_id
-        forecaster_shell.database = forecaster.database
+        forecaster_shell.t_init = env_config.get("episode_start", pd.Timestamp('20170101', tz='UTC'))
+        forecaster_shell.cache_id = ""
+        forecaster_shell.database = data_object
         forecaster = forecaster_shell
+    else:
+        forecaster = DataForecaster(from_pickle=True, cache_id=data_cache_id)
+        forecaster = forecaster.unpickle()
+        forecaster.t_init = forecaster.test_data.index[0]
     
     env = env_class(rfp=rfp, forecaster=forecaster, decision_horizon=24, **env_config)
     
@@ -80,6 +81,7 @@ class RFPBaseEnv(gym.Env):
         self.original_forecaster = forecaster
         self.decision_horizon = decision_horizon # Decision horizon in hours
         self.allow_spot_buy = allow_spot_buy
+        self.enforce_rfnbo = kwargs.get("enforce_rfnbo", False)
         self.inflexible = inflexible
         # Whether to normalize the state and action spaces (dependent on the algorithm used for decision-making)
         # Should maybe be set by the agent instead?
@@ -96,6 +98,7 @@ class RFPBaseEnv(gym.Env):
         self.forecaster = None # Placeholder for the currently used initialization of forecaster.
 
         """ Retrieve mappers, which produce VRE profiles for single assets, given a system level production profile. """
+        from common_scripts.utils import cache_read
         cache_path_mappers = os.getcwd() + "/models/plant_models/"
         solar_mapper = cache_read(cache_path_mappers + "solar.pkl")
         self.solar_mapper = VRESystemToAssetMapping(solar_mapper)
@@ -152,6 +155,7 @@ class RFPBaseEnv(gym.Env):
                             shape = (self.decision_horizon, len(self.action_identity)), dtype = np.float64)
         
         # Define scaler for normalizing the action space
+        from sklearn.preprocessing import MinMaxScaler
         self.action_scaler = MinMaxScaler(feature_range=(0, 1))
         self.action_scaler.fit(np.vstack([self.action_space.low, self.action_space.high]))
 
@@ -329,8 +333,8 @@ class RFPBaseEnv(gym.Env):
         forecast_prices = self.price_context
         X_forecast = pd.DataFrame(data={"price":forecast_prices, "wind":wind, "solar":solar})
         X_real = pd.DataFrame(data={"price":real_prices, "wind":wind, "solar":solar})
-        forecast_emissions = self.emissions_model(X_forecast) / 1000 # Convert to unit tCO2/MWh.
-        real_emissions = self.emissions_model(X_real) / 1000 # Convert to unit tCO2/MWh.
+        forecast_emissions = self.emissions_model(X_forecast) # Convert to unit tCO2/MWh.
+        real_emissions = self.emissions_model(X_real) # Convert to unit tCO2/MWh.
 
         self.realized_emissions.extend(real_emissions)
         self.emissions_context = forecast_emissions
@@ -360,8 +364,10 @@ class RFPBaseEnv(gym.Env):
         """
         # Reset core and stochastic components of environment:
         super().reset(seed=seed)
+        import copy
         self.forecaster = copy.deepcopy(self.original_forecaster) # self.forecaster.set_seed(np.random.randint(low=0,high=2**30))
         self.time = self.forecaster.t_init
+        from dateutil.relativedelta import relativedelta # NOTE: Consider changing to pd.Dateoffset()
         self.episode_end = self.forecaster.t_init + relativedelta(years=+1) - pd.Timedelta(1, 'hour') # Episodic implementation
         self.scenario_number += 1
         if options is not None:
@@ -369,6 +375,7 @@ class RFPBaseEnv(gym.Env):
         
         self.scenario_path = f"scenario_data/{self.data_cache_id}_scenario_{self.scenario_number}/"
         
+        from collections import deque
         self.realized_prices    = deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size)
         self.realized_ppa       = [deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size) for _ in range(self.observation_space["context"]["ppas"].shape[1])]
         self.realized_emissions = deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size)
@@ -381,7 +388,7 @@ class RFPBaseEnv(gym.Env):
         self._set_context()
 
         obs = self._get_obs()
-        info = {"time": self.time,}
+        info = {"time": self.time, "end_time": self.episode_end}
         self.episode_unix_start = get_unix_time()
 
         return obs, info
@@ -539,6 +546,7 @@ class RFPShieldEnv(RFPBaseEnv):
         # --- Update context ---
         self.time += pd.Timedelta(self.decision_horizon, 'h')
         info["time"] = self.time
+        info["end_time"] = self.episode_end
         
         self._set_context(terminated=terminated)
 
@@ -572,6 +580,7 @@ class RFPYearEnv(RFPShieldEnv):
     def __init__(self, rfp, forecaster = None, allow_spot_buy=True, inflexible=False, normalize = False, verbose = False, load_data=True, **kwargs):
         self.original_forecaster = forecaster
         t = self.original_forecaster.t_init
+        from dateutil.relativedelta import relativedelta
         t_end = self.original_forecaster.t_init + relativedelta(years=+1) # Episodic implementation
         horizon = (t_end - t).days * 24 # Number of hours in the year.
         self.realization_memory_size = horizon
@@ -681,6 +690,7 @@ class RFPModelActionsEnv(RFPBaseEnv):
         # --- Update context ---
         self.time += pd.Timedelta(self.decision_horizon, 'h')
         info["time"] = self.time
+        info["end_time"] = self.episode_end
 
         self._set_context(terminated=terminated)
 
@@ -809,6 +819,7 @@ class RFPBackcastEnv(RFPModelActionsEnv):
 
         self.forecast_path = f"scenario_data/Historicals/{self.forecaster_type}/"
         
+        from collections import deque
         self.realized_prices    = deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size)
         self.realized_ppa       = [deque(np.zeros(self.realization_memory_size), maxlen=self.realization_memory_size)
                                    for _ in range(self.observation_space["context"]["ppas"].shape[1])]
@@ -823,7 +834,7 @@ class RFPBackcastEnv(RFPModelActionsEnv):
         self._set_context()
 
         obs = self._get_obs()
-        info = {"time": self.time, "forecast_path": self.forecast_path,}
+        info = {"time": self.time, "forecast_path": self.forecast_path, "end_time": self.episode_end}
         self.episode_unix_start = get_unix_time()
 
         return obs, info
@@ -865,7 +876,7 @@ class RFPBackcastEnv(RFPModelActionsEnv):
         # forecast_prices = self.price_context
         # X_forecast = pd.DataFrame(data={"price":forecast_prices, "wind":wind, "solar":solar})
         # forecast_emissions = self.emissions_model(X_forecast) / 1000 # Convert to unit tCO2/MWh.
-        real_emissions = self.historical_data.loc[self.time:self.time+pd.Timedelta(self.decision_horizon-1,'h'),"emissions"].values / 1000 # Convert to unit tCO2/MWh.
+        real_emissions = self.historical_data.loc[self.time:self.time+pd.Timedelta(self.decision_horizon-1,'h'),"emissions"].values # Convert to unit tCO2/MWh.
 
         self.realized_emissions.extend(real_emissions)
         self.emissions_context = self.context_space["emissions"].low

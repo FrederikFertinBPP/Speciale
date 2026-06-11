@@ -34,6 +34,7 @@ class HierarchicalAgent(Agent):
         self.decision_horizon = self.env.decision_horizon
         self.planning_horizon = max(planning_horizon, self.decision_horizon)
         self.allow_spot_buy = self.env.allow_spot_buy
+        self.enforce_rfnbo = self.env.enforce_rfnbo
 
         if hourly_model_class is not None:
             self.hourly_model = hourly_model_class(rfp = self.env.rfp,
@@ -225,7 +226,7 @@ class DeterministicHA(HierarchicalAgent):
     def _get_forecast_available_power(self, simulation):
         simulation = simulation.copy()
         gcp_cap = self.env.rfp.get_component('Grid Connection Point').parameters.get('capacity')
-        if self.allow_spot_buy:
+        if self.allow_spot_buy and not(self.enforce_rfnbo):
             # We always have our full GCP capacity available.
             simulation['available_power'] = gcp_cap
         else:
@@ -240,6 +241,9 @@ class DeterministicHA(HierarchicalAgent):
                 else:
                     simulation['available_power'] += cap # Assumes full availability of non-variable PPAs.
             simulation['available_power'] = np.clip(simulation['available_power'], 0, gcp_cap)
+            if self.enforce_rfnbo: # If the day-ahead price is below 20 €/MWh or 36% of the ETS price, then we can buy from the grid.
+                simulation["price"] < max(20, 0.36 )
+                # If we enforce RFNBO, we can only use the renewable PPAs for ammonia production, and we assume that they are fully used for hydrogen production when hydrogen is produced.
             # simulation['wind']            = self.env.wind_mapper(simulation['wind']) * self.env.wind_capacity
             # simulation['solar']           = self.env.solar_mapper(simulation['solar']) * self.env.solar_capacity
             # simulation['available_power'] = np.clip(simulation['wind'] + simulation['solar'] + self.env.get_baseload_ppa_power(),0,gcp_cap)
@@ -251,7 +255,7 @@ class DeterministicHA(HierarchicalAgent):
                     hourly_need += contract.parameters.get('volume') * self.electricity_consumption[contract.parameters.get('resource')]
         simulation['hourly_contract_need'] = hourly_need
         simulation['available_power_for_ammonia'] = simulation['available_power'] - simulation['hourly_contract_need']
-        simulation['shifted_available_power']     = simulation['available_power_for_ammonia']
+        # simulation['shifted_available_power']     = simulation['available_power_for_ammonia']
         # Create shifted availability profile to account for negatives in case of large constant hydrogen outflow.
         # for ix in range(len(simulation)-1, 0, -1):
         #     p = simulation.iloc[ix]['shifted_available_power']
@@ -259,8 +263,8 @@ class DeterministicHA(HierarchicalAgent):
         #         simulation.loc[simulation.index[ix], 'shifted_available_power'] = 0
         #         simulation.loc[simulation.index[ix-1], 'shifted_available_power'] += p
         # simulation.loc[simulation.index[0], 'shifted_available_power'] = np.max([simulation.iloc[0]['shifted_available_power'], 0])
-        # simulation['potential_ammonia_production'] = np.clip(simulation['shifted_available_power'] / self.electricity_consumption['ammonia'], 0,
-        #                                                     self.env.rfp.get_component('Haber Bosch Plant').parameters.get('capacity', 50)) # tNH3 for every hour
+        hb_cap = self.env.rfp.get_component('Haber Bosch Plant').parameters.get('capacity', 50) * self.electricity_consumption['ammonia']
+        simulation['available_power_for_ammonia'] = np.clip(simulation['available_power_for_ammonia'], 0, hb_cap) # MWh NH3/hour
         return simulation
 
     def _calculate_hourly_ammonia_target(self, obs, time, info):
@@ -389,7 +393,9 @@ class DeterministicHA(HierarchicalAgent):
             if is_backcasting:
                 n_sims = 1
                 timestamp_str = time.strftime("%Y-%m-%d")
-                year_simulations = [pd.read_csv(info["forecast_path"] + f"long-term-sim_{timestamp_str}.csv", index_col=0)]
+                projection = pd.read_csv(info["forecast_path"] + f"long-term-sim_{timestamp_str}.csv", index_col=0)
+                projection.index = pd.to_datetime(projection.index)
+                year_simulations = [projection.loc[projection.index<=info["end_time"]]]
             elif self.env.load_data:
                 # if n_sims > 5:
                 #     print("Only generated 5 simulations year ahead - setting number of sims to 5.")
@@ -446,7 +452,13 @@ class DeterministicHA(HierarchicalAgent):
                 for lim in limits:
                     energy_to_allocate_limits[lim][freq][first_target[freq]] = target_energy_current_limits[lim][freq]
 
-            # -------------------- Calculate internal strike price - based on contracts -------------------- #
+            # --------------------  Estimate minimum load of plant which is forced consumption for all hours. -------------------- #
+            min_hourly_loading = 0
+            if self.hourly_model.inflexible:
+                for link, b in self.hourly_model.rfp.get_links().items():
+                    min_hourly_loading += b.parameters.get("min_load", 0) * b.parameters.get("electricity_consumption", 0)
+
+            # -------------------- Calculate internal strike price - based on above -------------------- #
             strike_prices = np.zeros(n_sims)
             strike_prices_hydrogen = np.zeros(n_sims)
             deadline_timeindices = np.where((energy_to_allocate["monthly"] > 0) | (energy_to_allocate["yearly"] > 0))[0]
@@ -467,15 +479,19 @@ class DeterministicHA(HierarchicalAgent):
                     _sorted = sim_slice.sort_values(by='price', ascending=True)
                     
                     # Now we can estimate the strike price of ammonia production:
-                    _sorted['cumulative_energy'] = np.cumsum(_sorted['available_power_for_ammonia'])
+                    _sorted['cumulative_energy'] = np.cumsum(_sorted['available_power_for_ammonia'] - min_hourly_loading)
                     n_hours = len(_sorted)
-                    strike_idx_hour = max(0, np.sum(_sorted['cumulative_energy'] <= missing_energy))
+                    strike_idx_hour = max(0,
+                                          np.sum(_sorted['cumulative_energy'] <= missing_energy - min_hourly_loading * (t_ix+1)
+                                                 ))
                     if strike_idx_hour >= n_hours*0.98: # If 98% of the hours are needed, then we incentivise non-stop max production of ammonia.
                         sp = self.ammonia_max_value / self.electricity_consumption['ammonia']
                     else: # Otherwise we get a strike price estimate based on the marginal hour needed to produce the missing energy.
                         sp = _sorted.iloc[strike_idx_hour]['price']
                     
-                    strike_idx_hour_limits = {lim: max(0, np.sum(_sorted['cumulative_energy'] <= missing_energy_limits[lim])) for lim in limits}
+                    strike_idx_hour_limits = {lim: max(0,
+                                                       np.sum(_sorted['cumulative_energy'] <= missing_energy_limits[lim] - min_hourly_loading * (t_ix+1)
+                                                                 )) for lim in limits}
                     sp_limits = {}
                     for lim in limits:
                         if strike_idx_hour_limits[lim] >= n_hours*0.98:
@@ -487,11 +503,27 @@ class DeterministicHA(HierarchicalAgent):
                     strike_prices[sim_ix] = max(strike_prices[sim_ix], sp_clipped)
                     
                     # We can alternatively get an estimate of the strike price of the electrolyzer:
-                    _sorted['hourly_cumulative_energy'] = np.cumsum(_sorted['available_power'])
-                    hourly_strike_idx = max(0, np.sum(_sorted['hourly_cumulative_energy'] <= missing_energy + hourly_energy_needed) - 1)
+                    _sorted['hourly_cumulative_energy'] = np.cumsum(_sorted['available_power'] - min_hourly_loading)
+                    hourly_strike_idx = max(0,
+                                            np.sum(_sorted['hourly_cumulative_energy'] <= missing_energy + hourly_energy_needed - min_hourly_loading * (t_ix+1)
+                                                      ) - 1)
                     hourly_sp = _sorted.iloc[hourly_strike_idx]['price']
-                    strike_prices_hydrogen[sim_ix] = max(strike_prices_hydrogen[sim_ix], hourly_sp)
-            
+                    # strike_prices_hydrogen[sim_ix] = max(strike_prices_hydrogen[sim_ix], hourly_sp)
+
+                    hourly_strike_idx_hour_limits = {lim: max(0,
+                                                              np.sum(_sorted['cumulative_energy'] <= missing_energy_limits[lim] + hourly_energy_needed_limits[lim] - min_hourly_loading * (t_ix+1)
+                                                                     )) for lim in limits}
+                    hourly_sp_limits = {}
+                    for lim in limits:
+                        if hourly_strike_idx_hour_limits[lim] >= n_hours*0.98:
+                            hourly_sp_limits[lim] = self.ammonia_max_value / self.electricity_consumption['ammonia']
+                        else: # Otherwise we get a strike price estimate based on the marginal hour needed to produce the missing energy.
+                            hourly_sp_limits[lim] = _sorted.iloc[hourly_strike_idx_hour_limits[lim]]['price']
+                    hourly_sp_clipped = np.clip(self.ammonia_contract_price / self.electricity_consumption['ammonia'],
+                                                hourly_sp_limits['min_volume'], hourly_sp_limits['max_volume'])
+                    # The contract/deadline encouraging the highest ISP is the one we should be considering in order to meet all deadlines:
+                    strike_prices_hydrogen[sim_ix] = max(strike_prices_hydrogen[sim_ix], hourly_sp_clipped)
+
             # -------------------- Calculate internal strike price - capped by storages -------------------- #
             # Storage limitations represent an upper bound for value of production:
             storage_capacities = dict(zip([storage.parameters.get("consumes")
@@ -1281,7 +1313,7 @@ class AggregateFullHorizonAgent(HierarchicalAgent):
                  solver='gurobi',
                  documentation=False,
                  objective_logic=None,
-                 n_sims=2,
+                 n_sims=1,
                  **kwargs,
                  ):
         super().__init__(env, *args,
@@ -1303,8 +1335,10 @@ class AggregateFullHorizonAgent(HierarchicalAgent):
         is_backcasting = bool(info.get("forecast_path", False))
         if is_backcasting:
             n_sims = 1
-            timestamp_str = time.strftime("%Y-%m-%d")
-            year_simulations = [pd.read_csv(info["forecast_path"] + f"long-term-sim_{timestamp_str}.csv", index_col=0)]
+            timestamp_str = time.strftime("%Y-%m-%d")                
+            projection = pd.read_csv(info["forecast_path"] + f"long-term-sim_{timestamp_str}.csv", index_col=0)
+            projection.index = pd.to_datetime(projection.index)
+            year_simulations = [projection.loc[projection.index<=info["end_time"]]]
         elif self.env.load_data:
             # if n_sims > 5:
             #     print("Only generated 5 simulations year ahead - setting number of sims to 5.")
@@ -1430,8 +1464,10 @@ class RecedingHorizonAgent(HierarchicalAgent):
         is_backcasting = bool(info.get("forecast_path", False))
         if is_backcasting and k % 7 == 0:
             timestamp_str = time.strftime("%Y-%m-%d")
-            self.year_sim = pd.read_csv(info["forecast_path"] + f"long-term-sim_{timestamp_str}.csv", index_col=0)
-        elif self.env.load_data and time.day_of_week == 0:
+            projection = pd.read_csv(info["forecast_path"] + f"long-term-sim_{timestamp_str}.csv", index_col=0)
+            projection.index = pd.to_datetime(projection.index)
+            self.year_sim = projection.loc[projection.index<=info["end_time"]]
+        elif not(is_backcasting) and self.env.load_data and time.day_of_week == 0:
             # if n_sims > 5:
             #     print("Only generated 5 simulations year ahead - setting number of sims to 5.")
             timestamp_str = time.strftime("%Y%m%d")
@@ -1441,7 +1477,7 @@ class RecedingHorizonAgent(HierarchicalAgent):
             # hours_extra = (int(timestamp_str) - int(updated_timestamp_str))*24 
             # year_simulations = [pd.read_csv(f"{self.env.scenario_path}year_sim_{updated_timestamp_str}_{ix}.csv").iloc[hours_extra:] for ix in range(n_sims)]
             self.year_sim = pd.read_csv(f"{self.env.scenario_path}year_sim_{timestamp_str}_0.csv")
-        elif time.day_of_week == 0 or self.year_sim is None:
+        elif not(is_backcasting or self.env.load_data) and time.day_of_week == 0 or self.year_sim is None:
             self.year_sim = self.env.forecaster.simulate_year_ahead(start = time, n_sims=1)[0] # Creates a list of n_sims simulated year-ahead forecasts (pd.DataFrame with hourly index and 'price', 'wind', 'solar' columns)
         else:
             self.year_sim = self.year_sim.iloc[self.decision_horizon:]

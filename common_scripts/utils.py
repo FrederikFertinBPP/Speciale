@@ -14,6 +14,7 @@ def set_plotting_style():
     import seaborn as sns
 
     sns.set_theme("notebook", font_scale=1.5, style="darkgrid")
+    sns.set_style({'font.family':'serif', 'font.serif':['Times New Roman']})
     plt.rcParams['font.size'] = 16
     # set legend fontsize to 14
     plt.rcParams['legend.fontsize'] = 18
@@ -148,8 +149,6 @@ def load_stats(experiment_name, csv_version=False):
             return cache_read(dir_path + "/stats.pkl") # trajectories
     else:
         return []
-
-from collections.abc import Iterable
 
 class Flattener:
     def __init__(self, sep=';', sep_iter='?'):

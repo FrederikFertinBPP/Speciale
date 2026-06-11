@@ -1,0 +1,12 @@
+component,type,optimal_capacity
+Hydrogen Storage,storage,9.186518066234783
+Ammonia Storage,storage,12703.420014873735
+ElectricitySpot,dayahead,976.9
+Grid Connection Point,link,259.40840340445135
+Electrolyzer,link,4.245869694478237
+Haber Bosch Plant,link,19.700036009553685
+Hydrogen Pipeline,offtaker,2.0
+Ammonia Shipment,offtaker,30000.0
+SolarPower,ppa,231.53165229839064
+WindPower,ppa,394.46523108432604
+HydroPower,ppa,37.868247994050904

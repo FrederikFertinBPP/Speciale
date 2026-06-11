@@ -552,7 +552,7 @@ class HourlyDeterministicLPModel:
         def objective_rule(inst):
             obj = self._cashflow_rule(inst)
             # Penalize storage ever so slightly - relates to opportunity cost of missing future storage space
-            obj -= sum(b.soc[t]*0.001 for name, b in self.inst.storageBlocks.items() for t in self.inst.T)
+            obj -= sum(b.soc[t]*0.01/b.capacity for name, b in self.inst.storageBlocks.items() for t in self.inst.T)
             if self.guideline == 'production_value':
                 obj += production_value_rule(inst)
             if self.objective_logic == 'value_maximization':
@@ -688,7 +688,9 @@ class HourlyStochasticLPModel(HourlyDeterministicLPModel):
                  n_scenarios: int = 3,
                  **kwargs,
                  ):
-        super().__init__(rfp, inflexible, planning_horizon, decision_horizon, solver, allow_spot_buy, guideline)
+        super().__init__(rfp=rfp, inflexible=inflexible, planning_horizon=planning_horizon,
+                         decision_horizon=decision_horizon, solver=solver,
+                         allow_spot_buy=allow_spot_buy, guideline=guideline)
         self.n_scenarios = n_scenarios
     
     def initialize_model(self):
@@ -776,6 +778,7 @@ class AggregativeModel(HourlyDeterministicLPModel):
     def __init__(self,
                  rfp: RenewableFuelPlant,
                  inflexible: bool = False,
+                 enforce_rfnbo: bool = False,
                  planning_horizon: int = 4*24,
                  decision_horizon: int = 24,
                  solver: str = 'scip',
@@ -785,7 +788,11 @@ class AggregativeModel(HourlyDeterministicLPModel):
                  documentation: bool = False,
                  **kwargs,
                  ):
-        super().__init__(rfp, inflexible, planning_horizon, decision_horizon, solver, allow_spot_buy, guideline, objective_logic, documentation, **kwargs)
+        super().__init__(rfp=rfp, inflexible=inflexible, enforce_rfnbo=enforce_rfnbo,
+                         planning_horizon=planning_horizon, decision_horizon=decision_horizon,
+                         solver=solver, allow_spot_buy=allow_spot_buy,
+                         guideline=guideline, objective_logic=objective_logic,
+                         documentation=documentation, **kwargs)
         self.planning_horizon += 1 # We add an extra time index to aggregate the flows of the rest of the year.
     
     def _build_abstract_model(self):
@@ -797,6 +804,13 @@ class AggregativeModel(HourlyDeterministicLPModel):
         self.model.offtaker_availabilities = pyo.Param(self.model.offtakers, within=pyo.NonNegativeIntegers, default=0, mutable=True)
         self.model.contract_deadlines = pyo.Param(self.model.contracts, within=pyo.NonNegativeIntegers, default=0, mutable=True)
         self.model.longterm_horizon = pyo.Param(within=pyo.NonNegativeIntegers, default=0, mutable=True)
+        # """ The last time index is the one aggregating the flows of the rest of the year. """
+        # self.model.T_aggregated = pyo.RangeSet(self.planning_horizon - self.n_aggregators, self.planning_horizon - 1)
+        # self.model.longterm_price = pyo.Param(self.model.T_aggregated, within=pyo.Reals, default=0, mutable=True)
+        # self.model.longterm_cfs = pyo.Param(self.model.T_aggregated, self.model.ppas, within=pyo.NonNegativeReals, default=0, mutable=True)
+        # self.model.offtaker_availabilities = pyo.Param(self.model.T_aggregated, self.model.offtakers, within=pyo.NonNegativeIntegers, default=0, mutable=True)
+        # self.model.contract_deadlines = pyo.Param(self.model.T_aggregated, self.model.contracts, within=pyo.NonNegativeIntegers, default=0, mutable=True)
+        # self.model.longterm_horizon = pyo.Param(self.model.T_aggregated, within=pyo.NonNegativeIntegers, default=0, mutable=True)
     
     def _build_concrete_instance(self, data=None):
         """ In concrete instance change (for the last time index representing the aggregate horizon):
@@ -894,7 +908,7 @@ class AggregativeModel(HourlyDeterministicLPModel):
         def soc_rule(inst, stor, t): # Define intertemporal SOC logic
             b = inst.storageBlocks[stor]
             if t == 0: # The initial SOC is externally given.
-                return b.soc[0] == inst.init_soc[stor] + b.in_flow[0] - b.out_flow[0]
+                return b.soc[t] == inst.init_soc[stor] + b.in_flow[t] - b.out_flow[t]
             else:
                 return b.soc[t] == b.soc[t-1] + b.in_flow[t] - b.out_flow[t]
         self.inst.soc_constraint = pyo.Constraint(self.inst.storages, self.inst.T, rule=soc_rule)
@@ -987,7 +1001,7 @@ class AggregativeModel(HourlyDeterministicLPModel):
         def objective_rule(inst):
             obj = self._cashflow_rule(inst)
             # Penalize storage ever so slightly - relates to opportunity cost of missing future storage space
-            obj -= sum(b.soc[t]*0.001 for name, b in self.inst.storageBlocks.items() for t in self.inst.T)
+            obj -= sum(b.soc[t]*0.01/b.capacity for name, b in self.inst.storageBlocks.items() for t in self.inst.T)
             return obj
 
         self.inst.objective = pyo.Objective(rule=objective_rule, sense=pyo.maximize)
@@ -1131,6 +1145,7 @@ class DecisionRuleModel(HourlyRecourseModel):
     def __init__(self,
                  rfp,
                  inflexible: bool = False,
+                 enforce_rfnbo: bool = False,
                  planning_horizon: int = 24,
                  decision_horizon: int = 24,
                  solver: str = 'scip',
@@ -1141,7 +1156,11 @@ class DecisionRuleModel(HourlyRecourseModel):
                  n_price_domains: int = 1,
                  domain_prices=[],
                  **kwargs):
-        super().__init__(rfp, inflexible, planning_horizon, decision_horizon, solver, allow_spot_buy, guideline, objective_logic, **kwargs)
+        super().__init__(rfp=rfp, inflexible=inflexible, enforce_rfnbo=enforce_rfnbo, 
+                         planning_horizon=planning_horizon, decision_horizon=decision_horizon,
+                         solver=solver, allow_spot_buy=allow_spot_buy,
+                         guideline=guideline, objective_logic=objective_logic,
+                         **kwargs)
         self.n_features = n_features # If 4, then it is: ["Bias", "Forecast Price", "Realized PPA Power", "Realized Price"]
         self.n_rules = 24 # One linear decision rule for each hour.
         self.n_price_domains = n_price_domains
@@ -1236,6 +1255,7 @@ class StochasticRecourseModel(HourlyRecourseModel):
     def __init__(self,
                  rfp: RenewableFuelPlant,
                  inflexible: bool = False,
+                 enforce_rfnbo: bool = False,
                  planning_horizon: int = 24,
                  decision_horizon: int = 24,
                  fixed_horizon: int = 12,
@@ -1246,7 +1266,10 @@ class StochasticRecourseModel(HourlyRecourseModel):
                  model_type = "non-recourse DA",
                  **kwargs,
                  ):
-        super().__init__(rfp, inflexible, planning_horizon, decision_horizon, solver, allow_spot_buy, guideline)
+        super().__init__(rfp=rfp, inflexible=inflexible, enforce_rfnbo=enforce_rfnbo,
+                         planning_horizon=planning_horizon, decision_horizon=decision_horizon,
+                         solver=solver, allow_spot_buy=allow_spot_buy,
+                         guideline=guideline)
         self.fixed_horizon = fixed_horizon
         self.n_scenarios = n_scenarios
         self.model_type = model_type
